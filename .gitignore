@@ -1,0 +1,116 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE / Editor artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Pytest / Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local databases, journals, and lock files
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.db-journal
+*.db-wal
+*.db-shm
+data/*.db
+data/*.db-*
+data/*.sqlite
+data/*.sqlite3
+data/*.sqlite-*
+data/attendance_agent.db*
+
+# Media, recordings, and temporary perception streams (Zero Raw Storage)
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.webm
+*.wav
+*.mp3
+*.flac
+*.aac
+*.ogg
+*.m4a
+data/recordings/
+data/exports/
+data/reports/
+data/temp/
+data/uploads/
+data/rosters/
+exports/
+reports/
+uploads/
+temp/
+
+# Student records, rosters, and tabular dumps (Privacy Guardrail)
+*.csv
+*.tsv
+*.xlsx
+*.parquet
+*.feather
+*.jsonl
+!data/sample/sample_roster.csv
+
+# Application logs, telemetry dumps, and runtime traces
+*.log
+*.log.*
+logs/
+data/logs/
+
+# Model weights, embeddings, and diagnostic checkpoints
+*.h5
+*.onnx
+*.pt
+*.pth
+*.pkl
+*.npy
+*.npz
+
+# Local environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Sample demonstration assets (non-sensitive synthetic files for evaluation)
+!data/sample/
+!data/sample/*

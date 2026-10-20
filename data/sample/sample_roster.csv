@@ -1,0 +1,6 @@
+student_id,course_code,full_name,email
+STU-001,CS101,Alice Johnson,alice.j@university.edu
+STU-002,CS101,Bob Martinez,bob.m@university.edu
+STU-003,CS101,Charlie Patel,charlie.p@university.edu
+STU-004,CS101,Diana Prince,diana.p@university.edu
+STU-005,CS101,Ethan Hunt,ethan.h@university.edu
