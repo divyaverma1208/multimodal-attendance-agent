@@ -193,3 +193,43 @@ def test_pipeline_run_batch_mode(synthetic_video_path: str) -> None:
     summary = pipeline.run_batch(max_frames=15)
     assert summary["total_observed_tracks"] >= 1
     assert db.get_session(summary["session_id"])["status"] == "CONCLUDED"
+
+
+def test_pipeline_headcount_accuracy_and_inactive_track_filtering(tmp_path: Path) -> None:
+    """Verify headcount counts only active, visible persons and excludes lost/spurious tracks."""
+    db_file = tmp_path / "headcount_test.db"
+    db = DatabaseManager(db_path=db_file)
+
+    detector_boxes = [(100, 100, 80, 120)]
+
+    pipeline = ClassroomPipeline(
+        db=db,
+        course_code="CS101",
+        session_title="Headcount Test",
+        video_source=0,  # Mocked via custom_detector
+        camera_enabled=True,
+        audio_enabled=False,
+        custom_detector=lambda frame: detector_boxes,
+    )
+    pipeline.start()
+
+    # Step 1: Exactly 1 person detected
+    res = pipeline.step(apply_pacing=False)
+    assert res.success is True
+    assert res.headcount == 1
+
+    # Step 2: Person disappears from camera view
+    detector_boxes = []
+    # Frame 1 missing (<= 3 frames tolerance)
+    res = pipeline.step(apply_pacing=False)
+    assert res.headcount == 1
+
+    # Frame 2 missing
+    pipeline.step(apply_pacing=False)
+    # Frame 3 missing
+    pipeline.step(apply_pacing=False)
+    # Frame 4 missing (> 3 frames): Headcount must drop to 0 rather than staying 1 for 30 frames
+    res4 = pipeline.step(apply_pacing=False)
+    assert res4.headcount == 0
+
+    pipeline.conclude()

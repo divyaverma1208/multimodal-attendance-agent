@@ -92,10 +92,10 @@ def test_configurable_retention_and_purge(tmp_path: Path) -> None:
     db.create_session(sess_old, "HIST101", "Old Lecture", "file")
     db.create_session(sess_new, "HIST101", "New Lecture", "file")
 
-    # Artificially age the old session to 45 days ago
+    # Artificially age the old session to 45 days ago and mark CONCLUDED
     with db.get_connection() as conn:
         conn.execute(
-            "UPDATE sessions SET created_at = datetime('now', '-45 days') WHERE session_id = ?;",
+            "UPDATE sessions SET created_at = datetime('now', '-45 days'), status = 'CONCLUDED' WHERE session_id = ?;",
             (sess_old,),
         )
 

@@ -13,6 +13,7 @@ from .analytics_page import render_analytics_page
 from .recommendations_page import render_recommendations_page
 from .settings_page import render_settings_page
 from .demo_data import clear_demo_sessions, is_demo_session, load_synthetic_demo_session
+from .navigation import navigate_to
 
 __all__ = [
     "render_dashboard",
@@ -25,4 +26,5 @@ __all__ = [
     "load_synthetic_demo_session",
     "clear_demo_sessions",
     "is_demo_session",
+    "navigate_to",
 ]

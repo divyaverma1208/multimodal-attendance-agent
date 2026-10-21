@@ -82,36 +82,88 @@ def compute_iou(boxA: Tuple[int, int, int, int], boxB: Tuple[int, int, int, int]
 
     inter_w = max(0, xB - xA)
     inter_h = max(0, yB - yA)
-    inter_area = inter_w * inter_h
+    inter_area = float(inter_w * inter_h)
 
-    boxA_area = boxA[2] * boxA[3]
-    boxB_area = boxB[2] * boxB[3]
-    union_area = float(boxA_area + boxB_area - inter_area)
+    boxA_area = float(boxA[2] * boxA[3])
+    boxB_area = float(boxB[2] * boxB[3])
+    union_area = boxA_area + boxB_area - inter_area
 
     if union_area <= 0:
         return 0.0
     return inter_area / union_area
 
 
+def compute_overlap_metrics(
+    boxA: Tuple[int, int, int, int],
+    boxB: Tuple[int, int, int, int],
+) -> Tuple[float, float]:
+    """
+    Compute both Intersection over Union (IoU) and Intersection over Minimum Area (IoM / containment ratio).
+    
+    Returns:
+        (iou, iom): Where iom represents what fraction of the smaller bounding box
+        is contained within the larger bounding box.
+    """
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
+    yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+
+    inter_w = max(0, xB - xA)
+    inter_h = max(0, yB - yA)
+    inter_area = float(inter_w * inter_h)
+
+    boxA_area = float(boxA[2] * boxA[3])
+    boxB_area = float(boxB[2] * boxB[3])
+    min_area = min(boxA_area, boxB_area)
+    union_area = boxA_area + boxB_area - inter_area
+
+    iou = inter_area / union_area if union_area > 0 else 0.0
+    iom = inter_area / min_area if min_area > 0 else 0.0
+    return iou, iom
+
+
 def apply_non_maximum_suppression(
     boxes: List[Tuple[int, int, int, int]],
     iou_threshold: float = 0.40,
+    iom_threshold: float = 0.45,
 ) -> List[Tuple[int, int, int, int]]:
     """
-    Suppresses redundant overlapping bounding boxes (e.g. multiple detector scales).
+    Suppresses redundant overlapping bounding boxes (e.g. multi-scale detections on the same subject).
+    Suppresses if standard IoU > iou_threshold OR if a smaller box is largely contained
+    within a larger detection (IoM > iom_threshold).
     Prioritizes larger bounding boxes.
     """
     if not boxes:
         return []
 
+    # Filter out invalid, degenerate (w <= 0 or h <= 0) or incomplete bounding boxes
+    valid_boxes = [
+        (int(b[0]), int(b[1]), int(b[2]), int(b[3]))
+        for b in boxes
+        if len(b) >= 4 and b[2] > 0 and b[3] > 0
+    ]
+    if not valid_boxes:
+        return []
+
     # Sort boxes by area descending
-    sorted_boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+    sorted_boxes = sorted(valid_boxes, key=lambda b: b[2] * b[3], reverse=True)
     kept_boxes: List[Tuple[int, int, int, int]] = []
 
     for box in sorted_boxes:
         overlap = False
+        c_x = box[0] + box[2] / 2.0
+        c_y = box[1] + box[3] / 2.0
         for kept in kept_boxes:
-            if compute_iou(box, kept) > iou_threshold:
+            iou, iom = compute_overlap_metrics(box, kept)
+            # Center of candidate box inside kept box
+            center_inside = (kept[0] <= c_x <= kept[0] + kept[2]) and (kept[1] <= c_y <= kept[1] + kept[3])
+            # Center of kept box inside candidate box
+            kept_cx = kept[0] + kept[2] / 2.0
+            kept_cy = kept[1] + kept[3] / 2.0
+            kept_inside = (box[0] <= kept_cx <= box[0] + box[2]) and (box[1] <= kept_cy <= box[1] + box[3])
+
+            if iou > iou_threshold or iom > iom_threshold or center_inside or kept_inside:
                 overlap = True
                 break
         if not overlap:
@@ -149,14 +201,15 @@ class CentroidTracker:
     def _compute_centroid(self, bbox: Tuple[int, int, int, int]) -> Tuple[int, int]:
         """Compute the center point (cx, cy) of a bounding box."""
         x, y, w, h = bbox
-        return (int(x + w / 2.0), int(y + h / 2.0))
+        return (int(round(float(x) + float(w) / 2.0)), int(round(float(y) + float(h) / 2.0)))
 
     def register(self, bbox: Tuple[int, int, int, int], timestamp: float) -> Track:
         """Register a new detected subject with a fresh anonymous ID."""
-        centroid = self._compute_centroid(bbox)
+        clean_bbox = (int(bbox[0]), int(bbox[1]), max(1, int(bbox[2])), max(1, int(bbox[3])))
+        centroid = self._compute_centroid(clean_bbox)
         track = Track(
             track_id=self.next_track_id,
-            bbox=bbox,
+            bbox=clean_bbox,
             centroid=centroid,
             first_seen_timestamp=timestamp,
             last_seen_timestamp=timestamp,
@@ -202,7 +255,10 @@ class CentroidTracker:
                 track.consecutive_missing_frames += 1
                 track.is_visible = False
                 track.movement_delta_px = 0.0
-                if track.consecutive_missing_frames > self.max_lost_frames:
+                # If track was only detected for a single frame and missed for >= 2 frames, purge immediately as noise
+                if track.total_frames_detected < 2 and track.consecutive_missing_frames >= 2:
+                    self.deregister(track_id)
+                elif track.consecutive_missing_frames > self.max_lost_frames:
                     self.deregister(track_id)
             return self.active_tracks
 
@@ -214,49 +270,72 @@ class CentroidTracker:
                 self.register(bbox, current_time)
             return self.active_tracks
 
-        # Case 3: Match existing tracks with incoming detections via Euclidean distance
+        # Case 3: Match existing tracks with incoming detections via hybrid Spatial-IoU cost minimization
         track_ids = list(self.active_tracks.keys())
         existing_centroids = [self.active_tracks[tid].centroid for tid in track_ids]
 
-        # Compute distance matrix: (num_existing, num_detections)
-        D = np.zeros((len(existing_centroids), len(input_centroids)), dtype=float)
-        for i, (ex, ey) in enumerate(existing_centroids):
-            for j, (cx, cy) in enumerate(input_centroids):
-                D[i, j] = math.hypot(ex - cx, ey - cy)
+        # Build candidate associations with multi-factor matching
+        candidate_pairs = []
+        for row, tid in enumerate(track_ids):
+            track = self.active_tracks[tid]
+            ex, ey = track.centroid
+            t_bbox = track.bbox
+            t_diag = math.hypot(t_bbox[2], t_bbox[3])
 
-        # Pairwise greedy distance minimization
-        rows = D.min(axis=1).argsort()
-        cols = D.argmin(axis=1)[rows]
+            for col, d_bbox in enumerate(clean_detections):
+                cx, cy = input_centroids[col]
+                dist = math.hypot(ex - cx, ey - cy)
+                iou, iom = compute_overlap_metrics(t_bbox, d_bbox)
+
+                # Check containment of center points
+                det_in_track = (t_bbox[0] <= cx <= t_bbox[0] + t_bbox[2]) and (t_bbox[1] <= cy <= t_bbox[1] + t_bbox[3])
+                track_in_det = (d_bbox[0] <= ex <= d_bbox[0] + d_bbox[2]) and (d_bbox[1] <= ey <= d_bbox[1] + d_bbox[3])
+
+                # Determine adaptive distance threshold based on box scale
+                d_diag = math.hypot(d_bbox[2], d_bbox[3])
+                adaptive_max_dist = max(self.max_distance_px, 0.60 * max(t_diag, d_diag))
+
+                is_valid = (
+                    (dist <= adaptive_max_dist)
+                    or (iou >= 0.20)
+                    or (iom >= 0.35)
+                    or det_in_track
+                    or track_in_det
+                )
+                if is_valid:
+                    # Cost formula: lower is better; high IoU and containment strongly reduce cost
+                    overlap_bonus = (iou * 200.0) + (100.0 if (det_in_track or track_in_det) else 0.0)
+                    cost = dist - overlap_bonus
+                    candidate_pairs.append((cost, row, col, dist, d_bbox, (cx, cy)))
+
+        # Sort candidate associations by cost ascending (best matches first)
+        candidate_pairs.sort(key=lambda x: x[0])
 
         used_rows = set()
         used_cols = set()
 
-        for row, col in zip(rows, cols):
+        for cost, row, col, dist, new_bbox, new_centroid in candidate_pairs:
             if row in used_rows or col in used_cols:
-                continue
-
-            # If distance exceeds threshold, do not associate (person is too far)
-            if D[row, col] > self.max_distance_px:
                 continue
 
             track_id = track_ids[row]
             track = self.active_tracks[track_id]
-            prev_centroid = track.centroid
-            new_centroid = input_centroids[col]
-            new_bbox = clean_detections[col]
 
-            # Update track state
-            track.movement_delta_px = math.hypot(
-                new_centroid[0] - prev_centroid[0],
-                new_centroid[1] - prev_centroid[1],
-            )
-            track.centroid = new_centroid
-            track.bbox = new_bbox
+            # Update track state with Exponential Moving Average (EMA) bounding box smoothing
+            alpha = 0.65
+            prev_b = track.bbox
+            smooth_x = int(round(alpha * new_bbox[0] + (1.0 - alpha) * prev_b[0]))
+            smooth_y = int(round(alpha * new_bbox[1] + (1.0 - alpha) * prev_b[1]))
+            smooth_w = int(round(alpha * new_bbox[2] + (1.0 - alpha) * prev_b[2]))
+            smooth_h = int(round(alpha * new_bbox[3] + (1.0 - alpha) * prev_b[3]))
+            track.bbox = (smooth_x, smooth_y, smooth_w, smooth_h)
+            track.centroid = self._compute_centroid(track.bbox)
+            track.movement_delta_px = dist
             track.last_seen_timestamp = current_time
             track.total_frames_detected += 1
             track.consecutive_missing_frames = 0
             track.is_visible = True
-            track.trajectory.append(new_centroid)
+            track.trajectory.append(track.centroid)
             if len(track.trajectory) > 50:
                 track.trajectory.pop(0)
 
@@ -271,7 +350,10 @@ class CentroidTracker:
             track.consecutive_missing_frames += 1
             track.is_visible = False
             track.movement_delta_px = 0.0
-            if track.consecutive_missing_frames > self.max_lost_frames:
+            # If track was only detected for a single frame and missed for >= 2 frames, purge immediately as noise
+            if track.total_frames_detected < 2 and track.consecutive_missing_frames >= 2:
+                self.deregister(track_id)
+            elif track.consecutive_missing_frames > self.max_lost_frames:
                 self.deregister(track_id)
 
         # Register new detections not matched with any existing track (entering persons)
@@ -284,6 +366,16 @@ class CentroidTracker:
     def get_all_session_tracks(self) -> List[Track]:
         """Return combined list of active and deregistered session tracks."""
         return list(self.active_tracks.values()) + list(self.deregistered_tracks.values())
+
+    def get_track(self, track_id: int) -> Optional[Track]:
+        """Retrieve a track by ID from active or deregistered collections."""
+        return self.active_tracks.get(track_id) or self.deregistered_tracks.get(track_id)
+
+    def reset(self) -> None:
+        """Reset tracker state, clearing active and deregistered tracks and restarting ID counter."""
+        self.next_track_id = 1
+        self.active_tracks.clear()
+        self.deregistered_tracks.clear()
 
 
 class HeadOrientationEstimator:
@@ -313,6 +405,9 @@ class HeadOrientationEstimator:
         Returns:
             HeadOrientation instance.
         """
+        if frame is None or getattr(frame, "size", 0) == 0:
+            return HeadOrientation(0.0, 0.0, "Unknown")
+
         x, y, w, h = bbox
         frame_h, frame_w = frame.shape[:2]
 
@@ -418,8 +513,22 @@ class PersonTracker:
         prev_active_ids = set(self.tracker.active_tracks.keys())
 
         # Check processing interval: if skipping, retain existing tracks without new matches
-        if (self.frame_counter % self.interval) != 0 and self._last_result is not None:
-            return self._last_result
+        if ((self.frame_counter - 1) % self.interval) != 0 and self._last_result is not None:
+            skipped_tracks = []
+            for t in self.tracker.active_tracks.values():
+                t.movement_delta_px = 0.0
+                skipped_tracks.append(t)
+            paced_result = TrackingFrameResult(
+                frame_index=self.frame_counter,
+                timestamp=now,
+                active_tracks=skipped_tracks,
+                new_tracks_count=0,
+                lost_tracks_count=0,
+                total_active_count=len(skipped_tracks),
+                raw_detections_count=len(detections),
+            )
+            self._last_result = paced_result
+            return paced_result
 
         # Update tracker
         active_dict = self.tracker.update(detections, timestamp=now)
@@ -448,3 +557,10 @@ class PersonTracker:
         )
         self._last_result = result
         return result
+
+    def reset(self) -> None:
+        """Reset the tracker engine, frame counter, and cached results."""
+        self.frame_counter = 0
+        self._last_result = None
+        self.tracker.reset()
+

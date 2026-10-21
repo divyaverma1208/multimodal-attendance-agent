@@ -18,7 +18,7 @@ import cv2
 import numpy as np
 
 from config.settings import settings
-from modules.person_tracker import CentroidTracker, Track
+from modules.person_tracker import CentroidTracker, Track, apply_non_maximum_suppression
 
 logger = logging.getLogger(__name__)
 
@@ -93,21 +93,45 @@ class VideoProcessor:
         self.last_frame_time: float = 0.0
         self.prev_gray_frame: Optional[np.ndarray] = None
 
-        # Safe detector initialization: check if Haar cascade XMLs exist on disk
+        # Safe detector initialization: check bundled project cascades, models, and cv2.data
         self.face_cascade: Optional[cv2.CascadeClassifier] = None
+        self.face_alt_cascade: Optional[cv2.CascadeClassifier] = None
+        self.profile_cascade: Optional[cv2.CascadeClassifier] = None
         self.upper_body_cascade: Optional[cv2.CascadeClassifier] = None
+        self.yunet_detector = None
+        self.yunet_model_path: Optional[str] = None
+        self._yunet_input_size: Optional[Tuple[int, int]] = None
 
-        face_xml = getattr(cv2.data, "haarcascades", "") + "haarcascade_frontalface_default.xml"
-        if Path(face_xml).exists():
-            fc = cv2.CascadeClassifier(face_xml)
-            if not fc.empty():
-                self.face_cascade = fc
+        cascade_search_dirs = [
+            Path(__file__).resolve().parent.parent / "data" / "cascades",
+            Path(__file__).resolve().parent / "cascades",
+            Path(getattr(cv2.data, "haarcascades", "")),
+        ]
 
-        body_xml = getattr(cv2.data, "haarcascades", "") + "haarcascade_upperbody.xml"
-        if Path(body_xml).exists():
-            bc = cv2.CascadeClassifier(body_xml)
-            if not bc.empty():
-                self.upper_body_cascade = bc
+        def _find_cascade(filename: str) -> Optional[cv2.CascadeClassifier]:
+            for sdir in cascade_search_dirs:
+                cpath = sdir / filename
+                if cpath.exists():
+                    cc = cv2.CascadeClassifier(str(cpath.resolve()))
+                    if not cc.empty():
+                        return cc
+            return None
+
+        self.face_alt_cascade = _find_cascade("haarcascade_frontalface_alt2.xml")
+        self.face_cascade = _find_cascade("haarcascade_frontalface_default.xml")
+        self.profile_cascade = _find_cascade("haarcascade_profileface.xml")
+        self.upper_body_cascade = _find_cascade("haarcascade_upperbody.xml")
+
+        # Check for YuNet ONNX face detection model
+        model_dirs = [
+            Path(__file__).resolve().parent.parent / "data" / "models",
+            Path(__file__).resolve().parent / "models",
+        ]
+        for mdir in model_dirs:
+            mpath = mdir / "face_detection_yunet_2023mar.onnx"
+            if mpath.exists() and hasattr(cv2, "FaceDetectorYN"):
+                self.yunet_model_path = str(mpath.resolve())
+                break
 
         # Built-in HOG People detector (guaranteed zero external file dependency)
         self.hog = cv2.HOGDescriptor()
@@ -299,7 +323,9 @@ class VideoProcessor:
 
     def detect_persons(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
         """
-        Detect human subjects in frame using Haar cascades (if available) or built-in HOG.
+        Detect human subjects in frame using modern YuNet DNN (if available),
+        multi-cascade Haar detectors (alt2, default, profile), upper-body cascade,
+        built-in HOG people detection, and synthetic video contour fallback.
 
         Args:
             frame: BGR frame as NumPy ndarray.
@@ -314,64 +340,194 @@ class VideoProcessor:
             return self.custom_detector(frame)
 
         detections: List[Tuple[int, int, int, int]] = []
-        if len(frame.shape) == 2:
-            gray = frame
+        frame_h, frame_w = frame.shape[:2]
+
+        # Target processing width for detection speed
+        det_scale = 640.0 / float(frame_w) if frame_w > 640 else 1.0
+        if det_scale < 1.0:
+            det_w = 640
+            det_h = max(1, int(frame_h * det_scale))
+            det_frame = cv2.resize(frame, (det_w, det_h))
         else:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.equalizeHist(gray)
+            det_w = frame_w
+            det_h = frame_h
+            det_frame = frame
 
-        # 1. Detect faces using Haar cascade if loaded
-        if self.face_cascade is not None and not self.face_cascade.empty():
+        # Convert to grayscale for Haar / contour pipelines
+        if len(det_frame.shape) == 2:
+            det_gray = det_frame
+        else:
+            det_gray = cv2.cvtColor(det_frame, cv2.COLOR_BGR2GRAY)
+
+        # ---------------------------------------------------------------------
+        # Tier 1: OpenCV YuNet Deep Neural Network Face Detector
+        # ---------------------------------------------------------------------
+        if self.yunet_model_path is not None and hasattr(cv2, "FaceDetectorYN"):
             try:
-                faces = self.face_cascade.detectMultiScale(
-                    gray,
-                    scaleFactor=1.1,
-                    minNeighbors=4,
-                    minSize=(30, 30),
-                )
-                for (x, y, w, h) in faces:
-                    person_w = int(w * 1.4)
-                    person_h = int(h * 2.2)
-                    person_x = max(0, int(x - (person_w - w) / 2))
-                    person_y = max(0, y)
-                    detections.append((person_x, person_y, person_w, person_h))
-            except Exception as e:
-                logger.debug("Face cascade detection error: %s", e)
+                score_thresh = max(0.65, getattr(settings.video, "person_detection_confidence", 0.65))
+                if self.yunet_detector is None or self._yunet_input_size != (det_w, det_h):
+                    self.yunet_detector = cv2.FaceDetectorYN.create(
+                        self.yunet_model_path, "", (det_w, det_h), score_threshold=score_thresh, nms_threshold=0.30
+                    )
+                    self._yunet_input_size = (det_w, det_h)
+                else:
+                    self.yunet_detector.setInputSize((det_w, det_h))
+                    self.yunet_detector.setScoreThreshold(score_thresh)
 
-        # 2. Fallback to upper body detector if loaded and no faces found
+                _, faces = self.yunet_detector.detect(det_frame)
+                if faces is not None and len(faces) > 0:
+                    min_full_dim = max(55, int(0.045 * min(frame_w, frame_h)))
+                    raw_faces: List[Tuple[int, int, int, int]] = []
+                    for face in faces:
+                        fx, fy, fw, fh = face[:4]
+                        score = float(face[14]) if len(face) > 14 else 1.0
+                        if score < score_thresh:
+                            continue
+                        # Reject sub-scale specks and background artifacts in detection frame
+                        if fw < 26 or fh < 26:
+                            continue
+                        # Reject non-face aspect ratios
+                        face_aspect = float(fh) / float(fw) if fw > 0 else 0.0
+                        if face_aspect < 0.65 or face_aspect > 1.85:
+                            continue
+
+                        rx = int(round(fx / det_scale))
+                        ry = int(round(fy / det_scale))
+                        rw = int(round(fw / det_scale))
+                        rh = int(round(fh / det_scale))
+                        if rw < min_full_dim or rh < min_full_dim:
+                            continue
+                        raw_faces.append((rx, ry, rw, rh))
+
+                    clean_faces = apply_non_maximum_suppression(raw_faces, iou_threshold=0.30, iom_threshold=0.40)
+                    for (rx, ry, rw, rh) in clean_faces:
+                        person_w = int(rw * 1.40)
+                        person_h = int(rh * 2.20)
+                        person_x = max(0, int(rx - (person_w - rw) / 2))
+                        person_y = max(0, int(ry - rh * 0.15))
+                        person_w = min(frame_w - person_x, person_w)
+                        person_h = min(frame_h - person_y, person_h)
+                        detections.append((person_x, person_y, person_w, person_h))
+            except Exception as e:
+                logger.debug("YuNet DNN face detection error: %s", e)
+
+        # ---------------------------------------------------------------------
+        # Tier 2: Multi-Cascade Haar Face Detection (alt2, default, profile, CLAHE)
+        # ---------------------------------------------------------------------
+        if not detections and (self.face_alt_cascade is not None or self.face_cascade is not None or self.profile_cascade is not None):
+            try:
+                min_face = max(32, int(45 * det_scale))
+                candidate_faces: List[Tuple[int, int, int, int]] = []
+
+                # Frontal Face Alt2 (highest accuracy, lowest false-positive rate)
+                if self.face_alt_cascade is not None and not self.face_alt_cascade.empty():
+                    alt_faces = self.face_alt_cascade.detectMultiScale(
+                        det_gray, scaleFactor=1.1, minNeighbors=6, minSize=(min_face, min_face)
+                    )
+                    for (x, y, w, h) in alt_faces:
+                        candidate_faces.append((x, y, w, h))
+
+                # Frontal Face Default
+                if not candidate_faces and self.face_cascade is not None and not self.face_cascade.empty():
+                    def_faces = self.face_cascade.detectMultiScale(
+                        det_gray, scaleFactor=1.1, minNeighbors=5, minSize=(min_face, min_face)
+                    )
+                    for (x, y, w, h) in def_faces:
+                        candidate_faces.append((x, y, w, h))
+
+                # CLAHE enhancement for challenging lighting conditions
+                if not candidate_faces and (self.face_alt_cascade or self.face_cascade):
+                    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                    clahe_gray = clahe.apply(det_gray)
+                    casc = self.face_alt_cascade or self.face_cascade
+                    cl_faces = casc.detectMultiScale(
+                        clahe_gray, scaleFactor=1.1, minNeighbors=5, minSize=(min_face, min_face)
+                    )
+                    for (x, y, w, h) in cl_faces:
+                        candidate_faces.append((x, y, w, h))
+
+                # Profile Face Cascade (turned heads)
+                if not candidate_faces and self.profile_cascade is not None and not self.profile_cascade.empty():
+                    prof_faces = self.profile_cascade.detectMultiScale(
+                        det_gray, scaleFactor=1.1, minNeighbors=5, minSize=(min_face, min_face)
+                    )
+                    for (x, y, w, h) in prof_faces:
+                        candidate_faces.append((x, y, w, h))
+
+                if candidate_faces:
+                    raw_faces = []
+                    for (x, y, w, h) in candidate_faces:
+                        rx = int(round(x / det_scale))
+                        ry = int(round(y / det_scale))
+                        rw = int(round(w / det_scale))
+                        rh = int(round(h / det_scale))
+                        raw_faces.append((rx, ry, rw, rh))
+
+                    clean_faces = apply_non_maximum_suppression(raw_faces, iou_threshold=0.30, iom_threshold=0.40)
+                    for (rx, ry, rw, rh) in clean_faces:
+                        person_w = int(rw * 1.40)
+                        person_h = int(rh * 2.20)
+                        person_x = max(0, int(rx - (person_w - rw) / 2))
+                        person_y = max(0, int(ry - rh * 0.15))
+                        person_w = min(frame_w - person_x, person_w)
+                        person_h = min(frame_h - person_y, person_h)
+                        detections.append((person_x, person_y, person_w, person_h))
+            except Exception as e:
+                logger.debug("Haar cascade face detection error: %s", e)
+
+        # ---------------------------------------------------------------------
+        # Tier 3: Upper Body Cascade
+        # ---------------------------------------------------------------------
         if not detections and self.upper_body_cascade is not None and not self.upper_body_cascade.empty():
             try:
+                min_body = max(45, int(65 * det_scale))
                 bodies = self.upper_body_cascade.detectMultiScale(
-                    gray,
-                    scaleFactor=1.1,
-                    minNeighbors=3,
-                    minSize=(50, 50),
+                    det_gray,
+                    scaleFactor=1.10,
+                    minNeighbors=5,
+                    minSize=(min_body, min_body),
                 )
                 for (x, y, w, h) in bodies:
-                    detections.append((int(x), int(y), int(w), int(h)))
+                    aspect = float(h) / float(w) if w > 0 else 0.0
+                    if 0.65 <= aspect <= 2.40:
+                        rx = int(round(x / det_scale))
+                        ry = int(round(y / det_scale))
+                        rw = int(round(w / det_scale))
+                        rh = int(round(h / det_scale))
+                        detections.append((rx, ry, rw, rh))
             except Exception as e:
                 logger.debug("Upper body cascade detection error: %s", e)
 
-        # 3. Fallback to built-in HOG People Detector (zero external model dependency)
+        # ---------------------------------------------------------------------
+        # Tier 4: Built-in HOG People Detector (Supported on both Webcam & Files)
+        # ---------------------------------------------------------------------
         if not detections and self.hog is not None:
             try:
                 boxes, _ = self.hog.detectMultiScale(
-                    frame,
+                    det_frame,
                     winStride=(8, 8),
                     padding=(4, 4),
                     scale=1.05,
                 )
                 for (x, y, w, h) in boxes:
-                    detections.append((int(x), int(y), int(w), int(h)))
+                    aspect = float(h) / float(w) if w > 0 else 0.0
+                    if 0.70 <= aspect <= 2.80:
+                        rx = int(round(x / det_scale))
+                        ry = int(round(y / det_scale))
+                        rw = int(round(w / det_scale))
+                        rh = int(round(h / det_scale))
+                        detections.append((rx, ry, rw, rh))
             except Exception as e:
                 logger.debug("HOG people detection error: %s", e)
 
-        # 4. Fallback: silhouette/contour detection for high-contrast subjects & synthetic demo videos
-        if not detections:
+        # ---------------------------------------------------------------------
+        # Tier 5: Fallback: Silhouette/contour detection for synthetic demo videos
+        # ---------------------------------------------------------------------
+        if not detections and not self.metadata.is_live:
             try:
-                _, thresh = cv2.threshold(gray, 40, 255, cv2.THRESH_BINARY)
+                raw_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) > 2 else frame
+                _, thresh = cv2.threshold(raw_gray, 40, 255, cv2.THRESH_BINARY)
                 contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                frame_h, frame_w = frame.shape[:2]
                 min_area = (frame_w * frame_h) * 0.008
                 max_area = (frame_w * frame_h) * 0.40
                 for cnt in contours:
@@ -384,7 +540,8 @@ class VideoProcessor:
             except Exception as e:
                 logger.debug("Silhouette contour detection error: %s", e)
 
-        return detections
+        # Final pass: deduplicate any overlapping person bounding boxes with IoM containment check
+        return apply_non_maximum_suppression(detections, iou_threshold=0.30, iom_threshold=0.40)
 
     def compute_motion_index(self, frame: np.ndarray) -> float:
         """
@@ -430,7 +587,13 @@ class VideoProcessor:
         Returns:
             Tuple of (annotated_frame, active_tracks, motion_index).
         """
-        current_time = timestamp if timestamp is not None else time.time()
+        if timestamp is not None:
+            current_time = timestamp
+        elif not self.metadata.is_live and self.metadata.source_fps > 0:
+            fps = self.target_fps if self.target_fps > 0 else self.metadata.source_fps
+            current_time = float(self.frame_index) / float(fps)
+        else:
+            current_time = time.time()
         
         # 1. Detect person bounding boxes
         detections = self.detect_persons(frame)
@@ -443,9 +606,15 @@ class VideoProcessor:
 
         # 4. Draw privacy-preserving visual overlays
         annotated = frame.copy()
+        visible_count = 0
         for track_id, track in active_tracks.items():
+            # Keep bounding box visible through brief detector dropouts (<= 3 frames)
+            if not track.is_visible and track.consecutive_missing_frames > 3:
+                continue
+            visible_count += 1
             x, y, w, h = track.bbox
-            cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 220, 115), 2)
+            color = (0, 220, 115)
+            cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
             
             label = f"Person {track_id}"
             cv2.putText(
@@ -454,7 +623,7 @@ class VideoProcessor:
                 (x, max(15, y - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
-                (0, 220, 115),
+                color,
                 2,
                 cv2.LINE_AA,
             )
@@ -462,11 +631,11 @@ class VideoProcessor:
             cx, cy = track.centroid
             cv2.circle(annotated, (cx, cy), 4, (0, 0, 255), -1)
 
-        # Summary watermark showing dimensions, FPS, and detected count
+        # Summary watermark showing dimensions, FPS, and confirmed active count
         fps_display = self.target_fps if self.target_fps > 0 else self.metadata.source_fps
         watermark = (
             f"Src: {self.metadata.resolution_str} @ {fps_display:.0f}FPS | "
-            f"Active: {len(active_tracks)} | Motion: {motion_index:.1f}%"
+            f"Active: {visible_count} | Motion: {motion_index:.1f}%"
         )
         cv2.putText(
             annotated,

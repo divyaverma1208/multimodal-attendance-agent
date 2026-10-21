@@ -56,6 +56,7 @@ class PipelineStepResult:
     session_status: SessionState = SessionState.READY
     error_message: Optional[str] = None
     message: str = ""
+    window_progress_str: str = ""
 
 
 class ClassroomPipeline:
@@ -76,6 +77,7 @@ class ClassroomPipeline:
         sustained_threshold_pct: float = 60.0,
         window_duration_sec: int = 30,
         custom_detector: Optional[Callable[[np.ndarray], List[Tuple[int, int, int, int]]]] = None,
+        audio_device_index: Optional[int] = None,
     ) -> None:
         """
         Initialize the end-to-end classroom pipeline.
@@ -91,6 +93,7 @@ class ClassroomPipeline:
             sustained_threshold_pct: Percentage of active session required for sustained presence.
             window_duration_sec: Time-window aggregation duration (default: 30s).
             custom_detector: Optional mock/custom person detector for testing or specialized cameras.
+            audio_device_index: Optional microphone hardware device index.
         """
         self.db = db
         self.course_code = course_code
@@ -102,6 +105,7 @@ class ClassroomPipeline:
         self.sustained_threshold_pct = sustained_threshold_pct
         self.window_duration_sec = window_duration_sec
         self.custom_detector = custom_detector
+        self.audio_device_index = audio_device_index
 
         # 1. Session Manager
         self.session_manager = SessionManager(db_manager=self.db)
@@ -137,11 +141,18 @@ class ClassroomPipeline:
         self.windows_history: List[MultimodalWindow] = []
         self._last_step_time: Optional[float] = None
         self._mic_started: bool = False
+        self.latest_audio_features: Optional[AudioFeatures] = None
+        self.latest_composite_activity: Optional[float] = None
 
     @property
     def session_id(self) -> Optional[str]:
         """Return the active session ID if initialized."""
         return self.session_metadata.session_id if self.session_metadata else None
+
+    @property
+    def mic_started(self) -> bool:
+        """Public indicator of whether microphone streaming is active."""
+        return self._mic_started
 
     # =========================================================================
     # Step 1: Create Session
@@ -191,7 +202,9 @@ class ClassroomPipeline:
         # Open microphone audio stream if enabled
         if self.audio_enabled and self.audio_processor:
             try:
-                self._mic_started = self.audio_processor.start_microphone_stream()
+                self._mic_started = self.audio_processor.start_microphone_stream(
+                    device_index=self.audio_device_index
+                )
             except Exception as e:
                 logger.warning("Microphone stream unavailable (%s); proceeding with audio disabled", e)
                 self._mic_started = False
@@ -214,11 +227,34 @@ class ClassroomPipeline:
         """Pause active session."""
         self.session_manager.pause_session()
 
+    def reconnect_sources(self) -> bool:
+        """Force restart and reconnect of both video capture and audio stream."""
+        if self.video_processor:
+            self.video_processor.release()
+            self.video_processor.open_source()
+        if self.audio_enabled and self.audio_processor:
+            self.audio_processor.stop_mic_stream()
+            try:
+                self._mic_started = self.audio_processor.start_microphone_stream(
+                    device_index=self.audio_device_index
+                )
+            except Exception as e:
+                logger.warning("Microphone stream unavailable on reconnect: %s", e)
+                self._mic_started = False
+        return True
+
     def resume(self) -> None:
         """Resume paused session."""
         self.session_manager.start_session()
         if self.camera_enabled and self.video_processor and not self.video_processor.is_opened():
             self.video_processor.open_source()
+        if self.audio_enabled and self.audio_processor and not self._mic_started:
+            try:
+                self._mic_started = self.audio_processor.start_microphone_stream(
+                    device_index=self.audio_device_index
+                )
+            except Exception:
+                pass
 
     # =========================================================================
     # Steps 3 through 10: Discrete Pipeline Execution Step
@@ -283,17 +319,35 @@ class ClassroomPipeline:
             # -----------------------------------------------------------------
             # 4. Detect and Track People
             # -----------------------------------------------------------------
-            annotated_frame, active_tracks, motion_idx = self.video_processor.process_frame(raw_frame)
+            annotated_frame, active_tracks, motion_idx = self.video_processor.process_frame(
+                raw_frame, timestamp=now
+            )
 
         # Extract audio chunk if active
-        audio_features: Optional[AudioFeatures] = None
-        if self.audio_enabled and self.audio_processor and self._mic_started:
-            try:
-                chunk = self.audio_processor.read_stream_chunk()
-                if chunk is not None and len(chunk) > 0:
-                    audio_features = self.audio_processor.process_audio_chunk(chunk, timestamp=now)
-            except Exception as e:
-                logger.debug("Audio chunk read failed: %s", e)
+        new_audio_feature: Optional[AudioFeatures] = None
+        if self.audio_enabled and self.audio_processor:
+            if not self._mic_started:
+                try:
+                    self._mic_started = self.audio_processor.start_microphone_stream(
+                        device_index=self.audio_device_index
+                    )
+                except Exception as e:
+                    logger.debug("Auto-reconnection of mic stream failed: %s", e)
+                    self._mic_started = False
+
+            if self._mic_started:
+                try:
+                    while True:
+                        chunk = self.audio_processor.read_stream_chunk()
+                        if chunk is None or len(chunk) == 0:
+                            break
+                        feat = self.audio_processor.process_audio_chunk(chunk, timestamp=now)
+                        self.latest_audio_features = feat
+                        new_audio_feature = feat
+                except Exception as e:
+                    logger.debug("Audio chunk read failed: %s", e)
+                    self.latest_audio_features = None
+                    new_audio_feature = None
 
         # ---------------------------------------------------------------------
         # 5. Calculate Attendance Observations
@@ -319,17 +373,21 @@ class ClassroomPipeline:
         # ---------------------------------------------------------------------
         # 6. Extract Visual and Audio Features & 7. Aggregate by Time Window
         # ---------------------------------------------------------------------
-        headcount = len(active_tracks) if self.camera_enabled else 0
+        visible_tracks = {
+            tid: tr for tid, tr in active_tracks.items()
+            if tr.is_visible or tr.consecutive_missing_frames <= 3
+        }
+        headcount = len(visible_tracks) if self.camera_enabled else 0
         head_pose_var = 0.0
-        if active_tracks:
-            poses = [t.head_orientation.yaw for t in active_tracks.values() if t.head_orientation]
+        if visible_tracks:
+            poses = [t.head_orientation.yaw for t in visible_tracks.values() if t.head_orientation]
             if len(poses) >= 2:
                 head_pose_var = float(np.var(poses))
 
         self.fusion_engine.record_sample(
             active_persons=headcount,
             movement_index=motion_idx,
-            audio_features=audio_features,
+            audio_features=new_audio_feature,
             timestamp=now,
             head_pose_variance=head_pose_var,
         )
@@ -356,6 +414,8 @@ class ClassroomPipeline:
                     speech_pct=completed_window.speech_activity_pct,
                     head_pose_variance=completed_window.head_pose_variance,
                 )
+                if composite_score is not None:
+                    self.latest_composite_activity = composite_score
 
                 # -------------------------------------------------------------
                 # 9. Generate Teaching Suggestions & 10. Save in SQLite
@@ -366,6 +426,20 @@ class ClassroomPipeline:
                     current_time=now,
                 )
 
+        # Window accumulation progress
+        w_start = self.fusion_engine.current_window_start or now
+        w_dur = self.fusion_engine.window_duration_sec
+        w_elapsed = max(0.0, now - w_start)
+        progress_str = f"Accumulating ({w_elapsed:.0f}s/{w_dur}s)"
+
+        # Persistent metrics to avoid sub-frame flickering on dashboard
+        effective_audio = new_audio_feature or self.latest_audio_features
+        effective_composite = self.latest_composite_activity
+        if effective_composite is None:
+            effective_composite = self.fusion_engine.get_current_instantaneous_activity()
+        if effective_composite is None:
+            effective_composite = 0.0
+
         return PipelineStepResult(
             success=True,
             frame=raw_frame,
@@ -373,13 +447,14 @@ class ClassroomPipeline:
             active_tracks=active_tracks,
             motion_index=motion_idx,
             headcount=headcount,
-            audio_features=audio_features,
+            audio_features=effective_audio,
             completed_window=completed_window,
             new_suggestions=new_suggestions,
             new_attendance_events=new_events,
-            composite_activity=composite_score,
+            composite_activity=effective_composite,
             elapsed_active_seconds=elapsed_sec,
             session_status=status,
+            window_progress_str=progress_str,
         )
 
     # =========================================================================

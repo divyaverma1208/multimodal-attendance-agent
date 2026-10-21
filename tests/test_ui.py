@@ -26,6 +26,7 @@ from ui import (
     render_recommendations_page,
     render_session_page,
     render_settings_page,
+    navigate_to,
 )
 
 
@@ -41,6 +42,7 @@ def test_ui_exports() -> None:
     assert callable(load_synthetic_demo_session)
     assert callable(clear_demo_sessions)
     assert callable(is_demo_session)
+    assert callable(navigate_to)
 
 
 def test_demo_data_lifecycle() -> None:
@@ -180,3 +182,77 @@ def test_attendance_events_and_csv_generation() -> None:
         assert b"Track ID" in att_csv
     finally:
         clear_demo_sessions(db)
+
+
+def test_quick_navigation_buttons() -> None:
+    """Test that clicking Quick Navigation cards switches pages and updates sidebar radio."""
+    at = AppTest.from_file(APP_PATH, default_timeout=10)
+    at.run()
+    assert not at.exception
+    assert at.sidebar.radio[0].value == "Home"
+
+    # 1. Click "Open Sessions" (btn_nav_sess)
+    btn_sess = at.button(key="btn_nav_sess")
+    assert btn_sess is not None
+    btn_sess.click().run()
+    assert not at.exception
+    assert at.sidebar.radio[0].value == "Classroom Sessions"
+    assert any("Classroom Sessions" in h.value for h in at.header)
+
+    # Return to Home
+    at.sidebar.radio[0].set_value("Home").run()
+    assert not at.exception
+    assert at.sidebar.radio[0].value == "Home"
+
+    # 2. Click "Open Attendance" (btn_nav_att)
+    btn_att = at.button(key="btn_nav_att")
+    assert btn_att is not None
+    btn_att.click().run()
+    assert not at.exception
+    assert at.sidebar.radio[0].value == "Attendance"
+    assert any("Attendance Ledger" in h.value for h in at.header)
+
+    # Return to Home
+    at.sidebar.radio[0].set_value("Home").run()
+    assert not at.exception
+
+    # 3. Click "Open Analytics" (btn_nav_anl)
+    btn_anl = at.button(key="btn_nav_anl")
+    assert btn_anl is not None
+    btn_anl.click().run()
+    assert not at.exception
+    assert at.sidebar.radio[0].value == "Analytics"
+    assert any("Classroom Activity Analytics" in h.value for h in at.header)
+
+    # Return to Home
+    at.sidebar.radio[0].set_value("Home").run()
+    assert not at.exception
+
+    # 4. Click "Open Recommendations" (btn_nav_rec)
+    btn_rec = at.button(key="btn_nav_rec")
+    assert btn_rec is not None
+    btn_rec.click().run()
+    assert not at.exception
+    assert at.sidebar.radio[0].value == "Teaching Recommendations"
+    assert any("Teaching Recommendations" in h.value for h in at.header)
+
+
+def test_attendance_empty_state_navigation() -> None:
+    """Test that clicking 'Go to Sessions' on an empty attendance page navigates to Sessions."""
+    # Use in-memory DB or temporary DB with no sessions
+    at = AppTest.from_file(APP_PATH, default_timeout=10)
+    at.run()
+    assert not at.exception
+
+    # Navigate to Attendance
+    at.sidebar.radio[0].set_value("Attendance").run()
+    assert not at.exception
+    assert at.sidebar.radio[0].value == "Attendance"
+
+    # If empty state button exists, click it and ensure navigation to Classroom Sessions
+    btns = [b for b in at.button if "Go to Sessions" in b.label]
+    if btns:
+        btns[0].click().run()
+        assert not at.exception
+        assert at.sidebar.radio[0].value == "Classroom Sessions"
+        assert any("Classroom Sessions" in h.value for h in at.header)

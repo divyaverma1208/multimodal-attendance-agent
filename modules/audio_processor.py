@@ -58,6 +58,16 @@ class AudioFeatures:
         """Alias for zero_crossing_rate."""
         return self.zero_crossing_rate
 
+    @property
+    def speech_ratio(self) -> float:
+        """Normalized speech activity proportion [0.0 to 1.0]."""
+        return max(0.0, min(1.0, self.speech_ratio_pct / 100.0))
+
+    @property
+    def speech_pct(self) -> float:
+        """Speech activity percentage [0.0 to 100.0]."""
+        return self.speech_ratio_pct
+
 
 @dataclass
 class AudioWindowResult:
@@ -132,28 +142,29 @@ class AudioProcessor:
     def compute_spectral_centroid(self, signal: np.ndarray) -> float:
         """
         Compute spectral centroid (center of spectral mass / acoustic brightness).
-        Uses Librosa when signal length is sufficient, falling back to discrete FFT.
+        Uses fast Discrete Fourier Transform (FFT) with Hanning window for real-time efficiency.
         """
         if signal.size < 64:
             return 0.0
 
         try:
-            # Use Librosa for standard short-time spectral centroid
-            # Adapt n_fft to input length so subframes don't trigger size warnings
-            n_fft = min(2048, 1 << (len(signal).bit_length() - 1))
-            n_fft = max(64, n_fft)
-            hop_length = max(16, n_fft // 4)
-            centroids = librosa.feature.spectral_centroid(
-                y=signal, sr=self.sample_rate, n_fft=n_fft, hop_length=hop_length
-            )
-            return float(np.mean(centroids))
-        except Exception:
-            # Fast Fourier transform fallback
             window = np.hanning(len(signal))
             spectrum = np.abs(np.fft.rfft(signal * window))
             freqs = np.fft.rfftfreq(len(signal), d=1.0 / self.sample_rate)
             sum_spec = np.sum(spectrum)
-            return float(np.sum(freqs * spectrum) / sum_spec) if sum_spec > 0 else 0.0
+            return float(np.sum(freqs * spectrum) / sum_spec) if sum_spec > 1e-12 else 0.0
+        except Exception:
+            try:
+                # Librosa fallback if FFT computation encounters an unexpected error
+                n_fft = min(2048, 1 << (len(signal).bit_length() - 1))
+                n_fft = max(64, n_fft)
+                hop_length = max(16, n_fft // 4)
+                centroids = librosa.feature.spectral_centroid(
+                    y=signal, sr=self.sample_rate, n_fft=n_fft, hop_length=hop_length
+                )
+                return float(np.mean(centroids))
+            except Exception:
+                return 0.0
 
     def calibrate_noise_floor(self, noise_sample: np.ndarray) -> float:
         """
@@ -179,8 +190,8 @@ class AudioProcessor:
         Multi-feature baseline Voice Activity Detector (VAD).
         Evaluates:
         1. RMS energy above adaptive ambient noise floor threshold ($RMS > \max(T_{default}, 2.2 \times \text{noise\_floor})$)
-        2. Zero-Crossing Rate within human speech boundaries ($0.015 \le ZCR \le 0.35$)
-        3. Spectral Centroid within characteristic human vocal frequency range ($200\text{ Hz} \le SC \le 4500\text{ Hz}$)
+        2. Zero-Crossing Rate within human speech boundaries ($0.004 \le ZCR \le 0.48$)
+        3. Spectral Centroid within characteristic human vocal frequency range ($150\text{ Hz} \le SC \le 4800\text{ Hz}$)
 
         Args:
             subframe: Short audio slice (~25-30ms).
@@ -192,7 +203,7 @@ class AudioProcessor:
             return False
 
         rms = self.compute_rms(subframe)
-        dynamic_threshold = max(self.energy_threshold, self.noise_floor * 2.2)
+        dynamic_threshold = max(self.energy_threshold, self.noise_floor * 2.0)
 
         # 1. Energy threshold check
         if rms < dynamic_threshold:
@@ -200,12 +211,12 @@ class AudioProcessor:
 
         # 2. ZCR check (speech has structured periodicity vs broadband white noise)
         zcr = self.compute_zcr(subframe)
-        if zcr < 0.01 or zcr > 0.40:
+        if zcr < 0.003 or zcr > 0.50:
             return False
 
         # 3. Spectral Centroid check (vocal resonance center of mass)
         centroid = self.compute_spectral_centroid(subframe)
-        if centroid < 180.0 or centroid > 4800.0:
+        if centroid < 120.0 or centroid > 5200.0:
             return False
 
         return True
@@ -249,7 +260,12 @@ class AudioProcessor:
                 speech_subframes += 1
 
         speech_ratio = (speech_subframes / total_subframes) * 100.0
-        is_speech = speech_ratio >= 15.0  # Overall chunk classified as speech if >=15% active
+        is_speech = speech_ratio >= 8.0  # Overall chunk classified as speech if >=8% active
+
+        # Adaptively track ambient noise floor during non-speech intervals
+        dynamic_threshold = max(self.energy_threshold, self.noise_floor * 2.0)
+        if rms < dynamic_threshold and not is_speech:
+            self.noise_floor = max(0.0005, min(0.02, 0.95 * self.noise_floor + 0.05 * rms))
 
         return AudioFeatures(
             rms_energy=round(rms, 4),
@@ -385,13 +401,60 @@ class AudioProcessor:
 
     # --- Live Microphone Capture with Safe Degradation ---
 
+    @staticmethod
+    def get_available_microphones() -> List[dict]:
+        """List available audio input devices detected on host system."""
+        try:
+            import sounddevice as sd
+            devices = sd.query_devices()
+            inputs = []
+            default_in = sd.default.device[0] if hasattr(sd.default, "device") else None
+            for idx, d in enumerate(devices):
+                if d.get("max_input_channels", 0) > 0:
+                    inputs.append({
+                        "index": idx,
+                        "name": d.get("name", f"Microphone {idx}"),
+                        "is_default": (idx == default_in),
+                    })
+            return inputs
+        except Exception as e:
+            logger.debug("Failed to query sound devices: %s", e)
+            return []
+
+    def test_microphone(self, device_index: Optional[int] = None, duration_sec: float = 1.0) -> Tuple[bool, str, float, float]:
+        """
+        Record a short sample from the microphone to test connectivity and speech levels.
+
+        Returns:
+            Tuple of (success: bool, message: str, rms: float, speech_ratio: float).
+        """
+        try:
+            import sounddevice as sd
+            frames_to_read = int(self.sample_rate * duration_sec)
+            recording = sd.rec(
+                frames=frames_to_read,
+                samplerate=self.sample_rate,
+                channels=1,
+                device=device_index,
+                dtype="float32",
+            )
+            sd.wait()
+            flat_audio = recording.flatten()
+            features = self.extract_features(flat_audio)
+            msg = f"Microphone operational. RMS: {features.rms_energy:.4f}, Speech Ratio: {features.speech_ratio_pct:.1f}%"
+            return True, msg, features.rms_energy, features.speech_ratio_pct
+        except Exception as e:
+            return False, f"Microphone test failed: {e}", 0.0, 0.0
+
     def start_mic_stream(self, device_index: Optional[int] = None) -> bool:
         """
-        Initialize live microphone stream using sounddevice with graceful error handling.
+        Initialize live microphone stream using sounddevice with graceful error handling and automatic device fallback.
 
         Returns:
             True if microphone stream opened successfully, False otherwise.
         """
+        self.stop_mic_stream()
+        self.active_device_index = device_index
         try:
             import sounddevice as sd
 
@@ -402,6 +465,18 @@ class AudioProcessor:
                 logger.warning(self.error_message)
                 return False
 
+            # Candidate device list to attempt in order:
+            # 1. User-requested device_index (if provided)
+            # 2. System default input (device=None)
+            # 3. Any device reporting max_input_channels > 0
+            candidates: List[Optional[int]] = []
+            if device_index is not None:
+                candidates.append(device_index)
+            candidates.append(None)
+            for idx, d in enumerate(devices):
+                if d.get("max_input_channels", 0) > 0 and idx not in candidates:
+                    candidates.append(idx)
+
             def _audio_callback(indata, frames, time_info, status):
                 if status:
                     logger.debug("Audio stream callback status: %s", status)
@@ -410,24 +485,56 @@ class AudioProcessor:
                 if not self._mic_queue.full():
                     self._mic_queue.put_nowait(data.copy())
 
-            self._mic_stream = sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=1,
-                device=device_index,
-                blocksize=int(self.sample_rate * 0.5),  # 0.5-second chunks
-                callback=_audio_callback,
+            last_err = None
+            for candidate in candidates:
+                try:
+                    sr_to_try = [self.sample_rate]
+                    if candidate is not None and candidate < len(devices):
+                        dev_sr = int(devices[candidate].get("default_samplerate", 44100))
+                        if dev_sr not in sr_to_try:
+                            sr_to_try.append(dev_sr)
+
+                    for sr in sr_to_try:
+                        stream = None
+                        try:
+                            stream = sd.InputStream(
+                                samplerate=sr,
+                                channels=1,
+                                device=candidate,
+                                blocksize=max(256, int(sr * 0.5)),  # 0.5-second chunks
+                                callback=_audio_callback,
+                            )
+                            stream.start()
+                            self._mic_stream = stream
+                            self.active_device_index = candidate
+                            self.status = AudioStatus.ACTIVE_STREAMING
+                            self.error_message = None
+                            logger.info(
+                                "Microphone stream started successfully at %s Hz (device=%s).",
+                                sr, candidate
+                            )
+                            return True
+                        except Exception as e:
+                            last_err = e
+                            if stream is not None:
+                                try:
+                                    stream.close()
+                                except Exception:
+                                    pass
+                except Exception as e:
+                    last_err = e
+
+            self.status = AudioStatus.DEVICE_UNAVAILABLE
+            self.error_message = (
+                f"Failed to access microphone. Ensure microphone permissions are granted. Details: {last_err}"
             )
-            self._mic_stream.start()
-            self.status = AudioStatus.ACTIVE_STREAMING
-            self.error_message = None
-            logger.info("Microphone stream started successfully at %s Hz.", self.sample_rate)
-            return True
+            logger.warning(self.error_message)
+            self.stop_mic_stream()
+            return False
 
         except Exception as e:
             self.status = AudioStatus.DEVICE_UNAVAILABLE
-            self.error_message = (
-                f"Failed to access microphone. Ensure microphone permissions are granted. Details: {e}"
-            )
+            self.error_message = f"Audio subsystem error: {e}"
             logger.warning(self.error_message)
             self.stop_mic_stream()
             return False
@@ -456,6 +563,7 @@ class AudioProcessor:
     start_microphone_stream = start_mic_stream
     stop_microphone_stream = stop_mic_stream
     read_stream_chunk = read_mic_chunk
+    process_audio_chunk = extract_features
 
     # --- Privacy Diagnostic Frame Guardrail ---
 

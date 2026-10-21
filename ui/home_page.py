@@ -11,6 +11,7 @@ import streamlit as st
 
 from modules.database import DatabaseManager
 from ui.demo_data import clear_demo_sessions, is_demo_session, load_synthetic_demo_session
+from ui.navigation import navigate_to
 
 
 def render_home_page(db: DatabaseManager) -> None:
@@ -52,40 +53,26 @@ def render_home_page(db: DatabaseManager) -> None:
         col_act1, col_act2 = st.columns([1, 4])
         with col_act1:
             if st.button("👉 Go to Active Session", type="primary", width="stretch"):
-                st.session_state.main_nav_selection = "Classroom Sessions"
-                st.rerun()
+                navigate_to("Classroom Sessions")
 
     # 3. Quick Navigation Launchers
     st.subheader("⚡ Quick Navigation")
     q1, q2, q3, q4 = st.columns(4)
 
-    with q1:
-        st.markdown("#### 📹 Sessions")
-        st.caption("Start or configure live camera / video file tracking.")
-        if st.button("Open Sessions", key="btn_nav_sess", width="stretch"):
-            st.session_state.main_nav_selection = "Classroom Sessions"
-            st.rerun()
+    nav_items = [
+        (q1, "📹 Sessions", "Start or configure live camera / video tracking.", "Open Sessions", "btn_nav_sess", "Classroom Sessions"),
+        (q2, "📋 Attendance", "Inspect verified vs provisional presence and export CSV.", "Open Attendance", "btn_nav_att", "Attendance"),
+        (q3, "📊 Analytics", "Review Plotly time-series charts and group activity trends.", "Open Analytics", "btn_nav_anl", "Analytics"),
+        (q4, "💡 Recommendations", "Inspect non-judgmental pedagogical teaching cues.", "Open Recommendations", "btn_nav_rec", "Teaching Recommendations"),
+    ]
 
-    with q2:
-        st.markdown("#### 📋 Attendance")
-        st.caption("Inspect verified vs provisional presence and export CSV.")
-        if st.button("Open Attendance", key="btn_nav_att", width="stretch"):
-            st.session_state.main_nav_selection = "Attendance"
-            st.rerun()
-
-    with q3:
-        st.markdown("#### 📊 Analytics")
-        st.caption("Review Plotly time-series charts and group activity trends.")
-        if st.button("Open Analytics", key="btn_nav_anl", width="stretch"):
-            st.session_state.main_nav_selection = "Analytics"
-            st.rerun()
-
-    with q4:
-        st.markdown("#### 💡 Recommendations")
-        st.caption("Inspect non-judgmental pedagogical teaching cues.")
-        if st.button("Open Recommendations", key="btn_nav_rec", width="stretch"):
-            st.session_state.main_nav_selection = "Teaching Recommendations"
-            st.rerun()
+    for col, title, desc, btn_label, btn_key, page_target in nav_items:
+        with col.container(border=True, height="stretch"):
+            st.markdown(f"##### {title}")
+            st.caption(desc)
+            st.space("stretch")
+            if st.button(btn_label, key=btn_key, width="stretch"):
+                navigate_to(page_target)
 
     st.markdown("---")
 

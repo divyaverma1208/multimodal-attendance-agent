@@ -237,15 +237,14 @@ def render_analytics_page(db: DatabaseManager) -> None:
     st.markdown("---")
 
     # Section 5: Epistemic Modesty & Limitations of Automated Observation (Requirement 9)
-    st.subheader("⚠️ Limitations of Automated Classroom Observation")
+    st.subheader("🛡️ Measurement Boundaries & Observational Guidelines")
     st.caption("Ethical guidelines and epistemological constraints governing observational telemetry.")
 
-    st.warning(
-        "**Epistemic Modesty Notice:** Automated observational telemetry reflects gross physical pixel displacement and acoustic short-time energy only. "
-        "It does NOT measure or infer internal psychological phenomena such as student attentiveness, engagement, emotional states, cognitive comprehension, or intelligence."
-    )
-
-    with st.expander("📖 Comprehensive Observation Limitations & Measurement Boundaries", expanded=True):
+    with st.expander("📖 View Observation Limitations & Epistemic Boundaries", expanded=False):
+        st.info(
+            "**Epistemic Modesty Notice:** Automated observational telemetry reflects gross physical pixel displacement and acoustic short-time energy only. "
+            "It does NOT measure or infer internal psychological phenomena such as student attentiveness, engagement, emotional states, cognitive comprehension, or intelligence."
+        )
         st.markdown(
             """
             1. **Physical Proxies vs. Psychological States:**

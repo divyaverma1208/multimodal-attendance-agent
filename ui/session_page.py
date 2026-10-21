@@ -44,6 +44,10 @@ def init_session_state(db: DatabaseManager) -> None:
         st.session_state.camera_enabled = True
     if "mic_enabled" not in st.session_state:
         st.session_state.mic_enabled = True
+    if "continuous_playback" not in st.session_state:
+        st.session_state.continuous_playback = True
+    if "chk_continuous_playback" not in st.session_state:
+        st.session_state.chk_continuous_playback = True
 
 
 def render_source_selection_form() -> Tuple[Union[int, str], int, bool, bool, float, str, str]:
@@ -80,10 +84,16 @@ def render_source_selection_form() -> Tuple[Union[int, str], int, bool, bool, fl
             if st.button("🔍 Test Camera"):
                 test_cap = cv2.VideoCapture(cam_idx)
                 if test_cap.isOpened():
+                    test_frame = None
+                    for _ in range(5):
+                        ret, test_frame = test_cap.read()
                     w = int(test_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                     h = int(test_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                     test_cap.release()
-                    st.success(f"Camera {cam_idx} online ({w}x{h})")
+                    vp_test = VideoProcessor(source=cam_idx)
+                    detected = vp_test.detect_persons(test_frame) if test_frame is not None else []
+                    det_msg = f" | Person Detected: {len(detected)}" if detected else " | Camera online"
+                    st.success(f"Camera {cam_idx} online ({w}x{h}){det_msg}")
                 else:
                     st.error(f"Camera {cam_idx} unavailable or permission denied.")
     else:
@@ -159,6 +169,40 @@ def render_source_selection_form() -> Tuple[Union[int, str], int, bool, bool, fl
         )
         st.session_state.mic_enabled = audio_enabled
 
+    mic_device_index = None
+    if audio_enabled:
+        from modules.audio_processor import AudioProcessor
+        mic_devices = AudioProcessor.get_available_microphones()
+        c_mic1, c_mic2 = st.columns([2, 1])
+        with c_mic1:
+            mic_options = {"System Default": None}
+            for d in mic_devices:
+                label = f"Device {d['index']}: {d['name']}"
+                if d.get("is_default"):
+                    label += " (Default)"
+                mic_options[label] = d["index"]
+
+            chosen_mic = st.selectbox(
+                "Select Microphone Device",
+                options=list(mic_options.keys()),
+                index=0,
+                help="Select input microphone for speech ratio analysis.",
+            )
+            mic_device_index = mic_options[chosen_mic]
+        with c_mic2:
+            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+            if st.button("🎙️ Test Microphone"):
+                ap_test = AudioProcessor()
+                with st.spinner("Listening for 1.5 seconds... speak now"):
+                    ok, msg, rms, sr = ap_test.test_microphone(device_index=mic_device_index, duration_sec=1.5)
+                if ok:
+                    if sr > 0.0 or rms > 0.003:
+                        st.success(f"Vocal activity confirmed! RMS: {rms:.4f} | Speech: {sr:.1f}%")
+                    else:
+                        st.info(f"Microphone online (RMS: {rms:.4f}, Speech: {sr:.1f}%). Speak to test speech detection.")
+                else:
+                    st.error(msg)
+
     # Processing Tuning
     c_tune1, c_tune2 = st.columns(2)
     with c_tune1:
@@ -179,7 +223,7 @@ def render_source_selection_form() -> Tuple[Union[int, str], int, bool, bool, fl
             help="Percentage of active session duration required for verified attendance.",
         )
 
-    return resolved_source, target_fps, camera_enabled, audio_enabled, threshold_pct, course_code, session_title
+    return resolved_source, target_fps, camera_enabled, audio_enabled, threshold_pct, course_code, session_title, mic_device_index
 
 
 def render_session_page(db: DatabaseManager) -> None:
@@ -219,9 +263,16 @@ def render_session_page(db: DatabaseManager) -> None:
 
         st.subheader("Initialize New Classroom Session")
 
-        resolved_source, target_fps, camera_enabled, audio_enabled, threshold_pct, course_code, session_title = (
-            render_source_selection_form()
-        )
+        (
+            resolved_source,
+            target_fps,
+            camera_enabled,
+            audio_enabled,
+            threshold_pct,
+            course_code,
+            session_title,
+            mic_device_index,
+        ) = render_source_selection_form()
 
         with st.expander("📜 Institutional Privacy, Consent & Data-Use Notice (Mandatory)", expanded=True):
             st.markdown(
@@ -270,6 +321,7 @@ def render_session_page(db: DatabaseManager) -> None:
                         audio_enabled=audio_enabled,
                         sustained_threshold_pct=threshold_pct,
                         window_duration_sec=30,
+                        audio_device_index=mic_device_index,
                     )
                     sess = pipeline.create_session()
                     st.session_state.pipeline = pipeline
@@ -367,6 +419,8 @@ def render_session_page(db: DatabaseManager) -> None:
             if current.status == SessionState.READY:
                 with c1:
                     if st.button("▶️ Start Session", type="primary", width="stretch"):
+                        st.session_state.continuous_playback = True
+                        st.session_state.chk_continuous_playback = True
                         if st.session_state.pipeline:
                             st.session_state.pipeline.start()
                         else:
@@ -382,6 +436,8 @@ def render_session_page(db: DatabaseManager) -> None:
             elif current.status == SessionState.ACTIVE:
                 with c1:
                     if st.button("⏸️ Pause", width="stretch"):
+                        st.session_state.continuous_playback = False
+                        st.session_state.chk_continuous_playback = False
                         if st.session_state.pipeline:
                             st.session_state.pipeline.pause()
                         else:
@@ -396,6 +452,8 @@ def render_session_page(db: DatabaseManager) -> None:
                             st.session_state.video_processor = None
                             st.session_state.active_tracks = {}
                             st.session_state.latest_step_result = None
+                            st.session_state.continuous_playback = False
+                            st.session_state.chk_continuous_playback = False
                             st.success(f"Session concluded. {summary.get('total_observed_tracks', 0)} participants evaluated.")
                         else:
                             total_sec = sm.conclude_session()
@@ -407,6 +465,7 @@ def render_session_page(db: DatabaseManager) -> None:
                                     total_session_active_seconds=total_sec,
                                     threshold_pct=current.sustained_threshold_pct,
                                     session_id=current.session_id,
+                                    session_start_epoch=current.created_at,
                                 )
                                 st.session_state.attendance_engine.sync_to_database(
                                     db=db,
@@ -418,21 +477,31 @@ def render_session_page(db: DatabaseManager) -> None:
                             st.session_state.active_tracks = {}
                             st.session_state.latest_step_result = None
                             st.session_state.continuous_playback = False
+                            st.session_state.chk_continuous_playback = False
                             st.success("Session concluded and attendance records synced.")
                         st.rerun()
 
-                # Stepping and Continuous Playback Controls
-                c_step1, c_step2 = st.columns(2)
+                # Stepping, Continuous Playback, and Reconnect Controls
+                c_step1, c_step2, c_step3 = st.columns([1, 2, 1])
                 with c_step1:
-                    if st.button("⏭️ Next Frame", width="stretch", help="Advance stream by one frame"):
+                    if st.button("📸 Step", width="stretch", help="Inspect a single frame"):
+                        st.session_state.continuous_playback = False
+                        st.session_state.chk_continuous_playback = False
                         st.rerun()
                 with c_step2:
-                    continuous = st.checkbox(
-                        "🔁 Live Playback / Stream",
-                        value=st.session_state.get("continuous_playback", False),
+                    continuous = st.toggle(
+                        "🔴 Live Continuous Monitoring",
+                        value=st.session_state.get("continuous_playback", True),
                         key="chk_continuous_playback",
+                        help="Stream video continuously in real time. Turn off to step frame-by-frame.",
                     )
                     st.session_state.continuous_playback = continuous
+                with c_step3:
+                    if st.button("🔄 Reconnect", width="stretch", help="Reconnect camera & microphone hardware"):
+                        if st.session_state.pipeline:
+                            st.session_state.pipeline.reconnect_sources()
+                        st.toast("Hardware sensors reconnected.")
+                        st.rerun()
 
                 # Fast Batch Processing for Recorded Video Files
                 if current.video_source_type == "file" and st.session_state.pipeline:
@@ -464,6 +533,8 @@ def render_session_page(db: DatabaseManager) -> None:
             elif current.status == SessionState.PAUSED:
                 with c1:
                     if st.button("▶️ Resume", type="primary", width="stretch"):
+                        st.session_state.continuous_playback = True
+                        st.session_state.chk_continuous_playback = True
                         if st.session_state.pipeline:
                             st.session_state.pipeline.resume()
                         else:
@@ -503,7 +574,10 @@ def render_session_page(db: DatabaseManager) -> None:
 
         # Hardware & Stream Status Card
         cam_status_str = "Disabled by user" if not st.session_state.camera_enabled else ("Online" if vp and vp.is_opened() else "Idle / Paused")
-        mic_status_str = "Online (VAD)" if current.audio_enabled else "Disabled by user"
+        mic_streaming = False
+        if st.session_state.pipeline and st.session_state.pipeline.audio_processor:
+            mic_streaming = (st.session_state.pipeline.audio_processor.status.value == "ACTIVE_STREAMING")
+        mic_status_str = "Online (Streaming)" if mic_streaming else ("Online (VAD)" if current.audio_enabled else "Disabled by user")
 
         st.markdown(
             f"""
@@ -523,6 +597,113 @@ def render_session_page(db: DatabaseManager) -> None:
         # Section 2: Perception Preview & Live Metrics
         feed_col, metrics_col = st.columns([3, 2])
 
+        with metrics_col:
+            st.markdown("#### Live Telemetry")
+            m1, m2 = st.columns(2)
+            headcount_slot = m1.empty()
+            motion_slot = m2.empty()
+
+            m3, m4 = st.columns(2)
+            speech_slot = m3.empty()
+            activity_slot = m4.empty()
+
+            st.markdown("##### Real-Time Anonymous Tracks")
+            tracks_slot = st.empty()
+
+            # Live Teaching Suggestions Box
+            st.markdown("##### Pedagogical Assistant Cues")
+            suggestions_slot = st.empty()
+
+            def update_telemetry_ui(tracks_dict, motion_val, latest_res):
+                """Update telemetry and track table in-place without page flickering."""
+                # Active presence: visible tracks or briefly occluded tracks within 3 frames
+                active_visible = {
+                    tid: tr for tid, tr in tracks_dict.items()
+                    if tr.is_visible or tr.consecutive_missing_frames <= 3
+                }
+                display_tracks = active_visible
+
+                if st.session_state.camera_enabled:
+                    count_val = len(display_tracks)
+                    label_str = "1 person" if count_val == 1 else f"{count_val} persons"
+                    headcount_slot.metric("Observed Headcount", label_str)
+                    motion_slot.metric("Motion Intensity", f"{motion_val:.1f}%")
+                else:
+                    headcount_slot.metric("Observed Headcount", "Unavailable", delta="Camera Disabled")
+                    motion_slot.metric("Motion Intensity", "Unavailable", delta="Camera Disabled")
+
+                if current.audio_enabled:
+                    pipe = st.session_state.pipeline
+                    af = latest_res.audio_features if (latest_res and latest_res.audio_features) else None
+                    if af is None and pipe and getattr(pipe, "latest_audio_features", None) is not None:
+                        af = pipe.latest_audio_features
+
+                    # Check stream status directly
+                    is_streaming = (
+                        pipe is not None
+                        and pipe.audio_processor is not None
+                        and pipe.audio_processor.status.value == "ACTIVE_STREAMING"
+                    )
+                    mic_err = None
+                    if not is_streaming and pipe and pipe.audio_processor:
+                        mic_err = pipe.audio_processor.error_message
+
+                    if mic_err and not (pipe and pipe._mic_started):
+                        speech_slot.metric("Speech Ratio", "Unavailable", delta="Hardware Error")
+                    elif af is not None:
+                        sr_pct = getattr(af, "speech_ratio_pct", None)
+                        if sr_pct is None and hasattr(af, "speech_ratio"):
+                            sr_pct = af.speech_ratio * 100.0
+                        if sr_pct is not None:
+                            status_label = "Vocal Activity" if (af.is_speech or sr_pct > 0.0) else "Quiet Room"
+                            speech_slot.metric("Speech Ratio", f"{sr_pct:.1f}%", delta=status_label)
+                        else:
+                            speech_slot.metric("Speech Ratio", "0.0%", delta="Quiet Room (Listening)")
+                    else:
+                        speech_slot.metric("Speech Ratio", "0.0%", delta="Quiet Room (Listening)")
+                else:
+                    speech_slot.metric("Speech Ratio", "Unavailable", delta="Mic Disabled")
+
+                ca = latest_res.composite_activity if latest_res else None
+                prog_str = getattr(latest_res, "window_progress_str", "") if latest_res else ""
+                if ca is not None:
+                    delta_label = "Fused Window" if (latest_res and latest_res.completed_window) else (prog_str or "Live Window")
+                    activity_slot.metric("Activity Index", f"{ca:.1f}%", delta=delta_label)
+                elif prog_str:
+                    activity_slot.metric("Activity Index", "0.0%", delta=prog_str)
+                else:
+                    activity_slot.metric("Activity Index", "0.0%", delta="Live Window")
+
+                if display_tracks and st.session_state.camera_enabled:
+                    track_data = []
+                    for tid, tr in display_tracks.items():
+                        dur_sec = max(0.1, tr.total_active_seconds) if tr.total_frames_detected >= 1 else tr.total_active_seconds
+                        dur_str = f"{dur_sec:.1f}s" if dur_sec < 60.0 else f"{dur_sec / 60.0:.1f}m"
+                        status_str = "🟢 Active" if tr.is_visible else "🟡 Occluded"
+                        track_data.append({
+                            "Track ID": f"Track-{tid}",
+                            "Status": status_str,
+                            "Active Duration": dur_str,
+                            "Frames Observed": tr.total_frames_detected,
+                        })
+                    tracks_slot.dataframe(track_data, hide_index=True)
+                else:
+                    tracks_slot.caption("No human subjects currently detected in view." if st.session_state.camera_enabled else "Visual tracking is disabled.")
+
+                suggestions = db.get_teaching_suggestions(current.session_id)
+                if suggestions:
+                    sug_text = "\n\n".join([f"💡 **{s['trigger_rule_code']}**: {s['suggestion_text']}" for s in suggestions[:3]])
+                    suggestions_slot.warning(sug_text)
+                else:
+                    suggestions_slot.info("No active pedagogical alerts. Pacing and dynamics within standard ranges.")
+
+            # Initial render of telemetry
+            update_telemetry_ui(
+                st.session_state.active_tracks,
+                getattr(st.session_state, "current_motion", 0.0),
+                getattr(st.session_state, "latest_step_result", None),
+            )
+
         with feed_col:
             st.markdown("#### Live Perception Stream")
             frame_placeholder = st.empty()
@@ -538,109 +719,62 @@ def render_session_page(db: DatabaseManager) -> None:
                         for sug in step_res.new_suggestions:
                             st.toast(f"💡 Suggestion: {sug.title}")
             elif current.status == SessionState.ACTIVE:
-                if st.session_state.pipeline:
-                    step_res = st.session_state.pipeline.step(apply_pacing=False)
-                    st.session_state.latest_step_result = step_res
-                    if step_res.success and step_res.annotated_frame is not None:
-                        st.session_state.active_tracks = step_res.active_tracks
-                        st.session_state.current_motion = step_res.motion_index
-                        rgb_frame = cv2.cvtColor(step_res.annotated_frame, cv2.COLOR_BGR2RGB)
-                        frame_placeholder.image(rgb_frame, channels="RGB", width="stretch", alt="Live Perception Stream")
-                        if step_res.completed_window:
-                            st.toast(f"Window fused: Activity {step_res.composite_activity or 0.0:.1f}%")
-                        if step_res.new_suggestions:
-                            for sug in step_res.new_suggestions:
-                                st.toast(f"💡 Suggestion: {sug.title}")
-                        if st.session_state.get("continuous_playback", False):
+                # Continuous in-place streaming loop (updates DOM placeholder without reloading the page)
+                is_continuous = st.session_state.get("continuous_playback", True)
+                burst_limit = 15 if is_continuous else 1
+
+                for frame_idx in range(burst_limit):
+                    if st.session_state.pipeline:
+                        step_res = st.session_state.pipeline.step(apply_pacing=False)
+                        st.session_state.latest_step_result = step_res
+                        if step_res.success and step_res.annotated_frame is not None:
+                            st.session_state.active_tracks = step_res.active_tracks
+                            st.session_state.current_motion = step_res.motion_index
+                            rgb_frame = cv2.cvtColor(step_res.annotated_frame, cv2.COLOR_BGR2RGB)
+                            frame_placeholder.image(rgb_frame, channels="RGB", width="stretch")
+                            if step_res.completed_window:
+                                st.toast(f"Window fused: Activity {step_res.composite_activity or 0.0:.1f}%")
+                            if step_res.new_suggestions:
+                                for sug in step_res.new_suggestions:
+                                    st.toast(f"💡 Suggestion: {sug.title}")
+                            if frame_idx % 3 == 0 or frame_idx == burst_limit - 1:
+                                update_telemetry_ui(step_res.active_tracks, step_res.motion_index, step_res)
+                        else:
+                            st.session_state.continuous_playback = False
                             pipe_vp = st.session_state.pipeline.video_processor
-                            t_fps = pipe_vp.target_fps if pipe_vp else (vp.target_fps if vp else 8)
-                            time.sleep(1.0 / max(1, t_fps))
-                            st.rerun()
-                    else:
-                        st.session_state.continuous_playback = False
-                        pipe_vp = st.session_state.pipeline.video_processor
-                        if pipe_vp and pipe_vp.status == VideoStatus.COMPLETED:
-                            frame_placeholder.success("🎉 Video playback completed (reached end of file).")
-                        elif pipe_vp and pipe_vp.status == VideoStatus.ERROR:
-                            frame_placeholder.error(f"Stream Error: {pipe_vp.error_message}")
+                            if pipe_vp and pipe_vp.status == VideoStatus.COMPLETED:
+                                frame_placeholder.success("🎉 Video playback completed (reached end of file).")
+                            elif pipe_vp and pipe_vp.status == VideoStatus.ERROR:
+                                frame_placeholder.error(f"Stream Error: {pipe_vp.error_message}")
+                            else:
+                                frame_placeholder.info("Awaiting video stream frames...")
+                            break
+                    elif vp:
+                        success, frame = vp.get_next_frame(apply_pacing=False)
+                        if success and frame is not None:
+                            annotated_frame, active_tracks, motion_index = vp.process_frame(frame)
+                            st.session_state.active_tracks = active_tracks
+                            st.session_state.current_motion = motion_index
+                            rgb_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                            frame_placeholder.image(rgb_frame, channels="RGB", width="stretch")
+                            if frame_idx % 3 == 0 or frame_idx == burst_limit - 1:
+                                update_telemetry_ui(active_tracks, motion_index, getattr(st.session_state, "latest_step_result", None))
                         else:
-                            frame_placeholder.info("Awaiting video stream frames...")
-                elif vp:
-                    success, frame = vp.get_next_frame(apply_pacing=False)
-                    if success and frame is not None:
-                        annotated_frame, active_tracks, motion_index = vp.process_frame(frame)
-                        st.session_state.active_tracks = active_tracks
-                        st.session_state.current_motion = motion_index
-                        rgb_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                        frame_placeholder.image(rgb_frame, channels="RGB", width="stretch", alt="Live Perception Stream")
-                        if st.session_state.get("continuous_playback", False):
-                            time.sleep(1.0 / max(1, vp.target_fps))
-                            st.rerun()
-                    else:
-                        st.session_state.continuous_playback = False
-                        if vp.status == VideoStatus.COMPLETED:
-                            frame_placeholder.success("🎉 Video playback completed (reached end of file).")
-                        elif vp.status == VideoStatus.ERROR:
-                            frame_placeholder.error(f"Stream Error: {vp.error_message}")
-                        else:
-                            frame_placeholder.info("Awaiting video stream frames...")
+                            st.session_state.continuous_playback = False
+                            if vp.status == VideoStatus.COMPLETED:
+                                frame_placeholder.success("🎉 Video playback completed (reached end of file).")
+                            elif vp.status == VideoStatus.ERROR:
+                                frame_placeholder.error(f"Stream Error: {vp.error_message}")
+                            else:
+                                frame_placeholder.info("Awaiting video stream frames...")
+                            break
+
+                    if is_continuous:
+                        time.sleep(0.04)  # ~25 FPS smooth playback
+
+                # Smooth loop continuation without per-frame page flicker
+                if is_continuous and st.session_state.get("continuous_playback", True):
+                    time.sleep(0.02)
+                    st.rerun()
             else:
                 frame_placeholder.info("Stream is currently idle or paused. Click 'Start Session' or 'Resume' to begin.")
-
-        with metrics_col:
-            st.markdown("#### Live Telemetry")
-            active_count = len(st.session_state.active_tracks) if st.session_state.camera_enabled else None
-            motion_val = getattr(st.session_state, "current_motion", None) if st.session_state.camera_enabled else None
-            latest_res = getattr(st.session_state, "latest_step_result", None)
-
-            m1, m2 = st.columns(2)
-            if active_count is not None:
-                m1.metric("Observed Headcount", f"{active_count} persons")
-            else:
-                m1.metric("Observed Headcount", "Unavailable", delta="Camera Disabled")
-
-            if motion_val is not None:
-                m2.metric("Motion Intensity", f"{motion_val:.1f}%")
-            else:
-                m2.metric("Motion Intensity", "Unavailable", delta="Camera Disabled")
-
-            m3, m4 = st.columns(2)
-            if current.audio_enabled:
-                speech_ratio = latest_res.audio_features.speech_ratio if (latest_res and latest_res.audio_features) else None
-                if speech_ratio is not None:
-                    m3.metric("Speech Ratio", f"{speech_ratio * 100:.1f}%")
-                else:
-                    m3.metric("Speech Ratio", "Awaiting audio")
-            else:
-                m3.metric("Speech Ratio", "Unavailable", delta="Mic Disabled")
-
-            comp_act = latest_res.composite_activity if latest_res else None
-            if comp_act is not None:
-                m4.metric("Activity Index", f"{comp_act:.1f}%")
-            else:
-                m4.metric("Activity Index", "Pending Window")
-
-            st.markdown("##### Real-Time Anonymous Tracks")
-            if st.session_state.active_tracks and st.session_state.camera_enabled:
-                track_data = []
-                for tid, tr in st.session_state.active_tracks.items():
-                    track_data.append({
-                        "Track ID": f"Track-{tid}",
-                        "Active Duration": f"{tr.total_active_seconds:.0f}s",
-                        "Frames Observed": tr.total_frames_detected,
-                    })
-                st.dataframe(track_data, hide_index=True)
-            else:
-                if not st.session_state.camera_enabled:
-                    st.caption("Visual tracking is disabled.")
-                else:
-                    st.caption("No human subjects currently detected in view.")
-
-            # Live Teaching Suggestions Box
-            st.markdown("##### Pedagogical Assistant Cues")
-            suggestions = db.get_teaching_suggestions(current.session_id)
-            if suggestions:
-                for s in suggestions[:3]:
-                    st.warning(f"💡 **{s['trigger_rule_code']}**: {s['suggestion_text']}")
-            else:
-                st.info("No active pedagogical alerts. Pacing and dynamics within standard ranges.")

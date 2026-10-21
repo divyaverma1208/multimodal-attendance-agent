@@ -281,3 +281,58 @@ def test_offline_capability_zero_cloud_dependencies() -> None:
     # SQLite operates in pure local mode
     db = DatabaseManager(":memory:")
     assert db.db_path == ":memory:"
+
+
+def test_multimodal_pipeline_with_audio_and_video(test_video_file: str, tmp_path: Path) -> None:
+    """
+    Test Phase 3, 4, 5, 9 integration:
+    Full multimodal session with simultaneous video frames and active audio chunks.
+    Verifies speech ratio extraction, feature fusion, persistent activity scoring,
+    and clean conclusion.
+    """
+    db_path = tmp_path / "multimodal_integration.db"
+    db = DatabaseManager(str(db_path))
+
+    pipeline = ClassroomPipeline(
+        db=db,
+        course_code="DATA201",
+        session_title="Multimodal Perception Lab",
+        video_source=test_video_file,
+        target_fps=10,
+        camera_enabled=True,
+        audio_enabled=True,
+        sustained_threshold_pct=50.0,
+        window_duration_sec=0.1,  # Short window for rapid test fusion
+        custom_detector=lambda frame: [(50, 50, 60, 120)],
+    )
+
+    pipeline.create_session()
+    pipeline.start()
+    pipeline._mic_started = True  # Mock mic started flag
+
+    # Feed synthetic vocal chunk into mic queue
+    from tests.test_audio_processor import generate_synthetic_speech
+    speech_data = generate_synthetic_speech(duration_sec=0.5, sample_rate=16000, f0=240.0)
+    pipeline.audio_processor._mic_queue.put(speech_data)
+
+    # Process first step: should ingest the audio chunk
+    res = pipeline.step(apply_pacing=False)
+    assert res.success is True
+    assert res.headcount == 1
+    assert res.audio_features is not None
+    assert res.audio_features.speech_ratio_pct > 20.0
+    assert res.audio_features.speech_ratio > 0.20
+    assert pipeline.latest_audio_features is not None
+
+    # Step through remaining frames until window closes
+    time.sleep(0.12)
+    res2 = pipeline.step(apply_pacing=False)
+    assert res2.success is True
+
+    # Conclude session cleanly
+    summary = pipeline.conclude()
+    assert summary["session_id"] == pipeline.session_id
+    assert summary["total_observed_tracks"] == 1
+    assert pipeline.video_processor.cap is None
+    assert pipeline._mic_started is False
+

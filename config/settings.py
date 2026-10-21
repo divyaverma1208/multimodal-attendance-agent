@@ -33,7 +33,7 @@ class VideoSettings:
     default_camera_index: int = int(os.getenv("CAMERA_INDEX", "0"))
     target_fps: int = int(os.getenv("TARGET_FPS", "8"))
     frame_size: Tuple[int, int] = (640, 480)
-    person_detection_confidence: float = float(os.getenv("DETECTION_CONFIDENCE", "0.5"))
+    person_detection_confidence: float = float(os.getenv("DETECTION_CONFIDENCE", "0.65"))
     max_lost_frames: int = int(os.getenv("MAX_LOST_FRAMES", "30"))
     max_centroid_distance_px: float = float(os.getenv("MAX_CENTROID_DISTANCE", "75.0"))
     use_mediapipe_if_available: bool = os.getenv("USE_MEDIAPIPE", "true").lower() == "true"
@@ -45,7 +45,7 @@ class AudioSettings:
     sample_rate: int = int(os.getenv("AUDIO_SAMPLE_RATE", "16000"))
     frame_duration_ms: int = 30
     chunk_size: int = 1024
-    energy_vad_threshold: float = float(os.getenv("VAD_ENERGY_THRESHOLD", "0.015"))
+    energy_vad_threshold: float = float(os.getenv("VAD_ENERGY_THRESHOLD", "0.005"))
     zcr_threshold: float = float(os.getenv("VAD_ZCR_THRESHOLD", "0.05"))
     enable_audio_by_default: bool = os.getenv("ENABLE_AUDIO", "true").lower() == "true"
 

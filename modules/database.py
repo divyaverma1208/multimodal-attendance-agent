@@ -5,12 +5,25 @@ Provides local SQLite persistence for sessions, course rosters, anonymous attend
 ledgers, time-windowed activity metrics, and teaching suggestion history.
 Enforces foreign key integrity, WAL mode, transaction safety, parameterized queries,
 and strict privacy preservation (zero storage of raw video or audio).
+
+Note on Roster Data Privacy:
+While raw multimodal sensor data (video frames and audio waveforms) are processed strictly
+ephemerally in RAM and never written to disk, enrolled student metadata (names and emails in
+the students table) is stored in local plaintext SQLite to enable roster association and attendance verification.
+For high-security production deployments subject to FERPA/GDPR encryption-at-rest requirements,
+host full-disk encryption (FileVault, BitLocker, LUKS) or SQLCipher should be configured.
+
+Note on Timestamp Conventions:
+- attendance_events.timestamp: Absolute UNIX epoch timestamp (seconds).
+- activity_windows.window_start_sec / window_end_sec: Relative offset (seconds) from session start.
+- teaching_suggestions.timestamp_sec: Relative offset (seconds) from session start.
 """
 
 from contextlib import contextmanager
 import logging
 from pathlib import Path
 import sqlite3
+import threading
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 from config.settings import settings
@@ -18,8 +31,13 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 
-class DatabaseError(Exception):
+class DatabaseError(sqlite3.Error):
     """Base exception raised for database operational and integrity errors."""
+    pass
+
+
+class DatabaseIntegrityError(DatabaseError, sqlite3.IntegrityError):
+    """Raised when a database constraint (UNIQUE, FOREIGN KEY, CHECK) is violated."""
     pass
 
 
@@ -42,6 +60,7 @@ class DatabaseManager:
             db_path: Path to the SQLite database file or ':memory:'.
                      Defaults to settings.db.db_path.
         """
+        self._lock = threading.Lock()
         if db_path is None:
             self.db_path: Union[str, Path] = settings.db.db_path
         elif isinstance(db_path, str) and db_path == ":memory:":
@@ -63,12 +82,13 @@ class DatabaseManager:
 
     def close(self) -> None:
         """Close persistent in-memory database connection if open."""
-        if self._mem_conn is not None:
-            try:
-                self._mem_conn.close()
-            except Exception:
-                pass
-            self._mem_conn = None
+        with self._lock:
+            if self._mem_conn is not None:
+                try:
+                    self._mem_conn.close()
+                except Exception:
+                    pass
+                self._mem_conn = None
 
     @contextmanager
     def get_connection(self) -> Generator[sqlite3.Connection, None, None]:
@@ -79,21 +99,27 @@ class DatabaseManager:
             Configured sqlite3.Connection instance with sqlite3.Row row factory.
 
         Raises:
+            DatabaseIntegrityError: If a UNIQUE, FOREIGN KEY, or CHECK constraint fails.
             DatabaseError: If connection or transaction execution fails.
         """
         if self._mem_conn is not None:
-            try:
-                self._mem_conn.execute("PRAGMA foreign_keys=ON;")
-                yield self._mem_conn
-                self._mem_conn.commit()
-            except sqlite3.Error as e:
-                self._mem_conn.rollback()
-                logger.error("Database transaction rolled back due to error: %s", e)
-                raise DatabaseError(f"Database transaction error: {e}") from e
-            except Exception as e:
-                self._mem_conn.rollback()
-                logger.error("Unexpected error in database transaction: %s", e)
-                raise DatabaseError(f"Unexpected database transaction error: {e}") from e
+            with self._lock:
+                try:
+                    self._mem_conn.execute("PRAGMA foreign_keys=ON;")
+                    yield self._mem_conn
+                    self._mem_conn.commit()
+                except sqlite3.IntegrityError as e:
+                    self._mem_conn.rollback()
+                    logger.error("Database integrity error: %s", e)
+                    raise DatabaseIntegrityError(f"Database integrity error: {e}") from e
+                except sqlite3.Error as e:
+                    self._mem_conn.rollback()
+                    logger.error("Database transaction rolled back due to error: %s", e)
+                    raise DatabaseError(f"Database transaction error: {e}") from e
+                except Exception as e:
+                    self._mem_conn.rollback()
+                    logger.error("Unexpected error in database transaction: %s", e)
+                    raise DatabaseError(f"Unexpected database transaction error: {e}") from e
             return
 
         try:
@@ -112,6 +138,10 @@ class DatabaseManager:
             conn.execute("PRAGMA foreign_keys=ON;")
             yield conn
             conn.commit()
+        except sqlite3.IntegrityError as e:
+            conn.rollback()
+            logger.error("Database integrity error: %s", e)
+            raise DatabaseIntegrityError(f"Database integrity error: {e}") from e
         except sqlite3.Error as e:
             conn.rollback()
             logger.error("Database transaction rolled back due to error: %s", e)
@@ -244,6 +274,22 @@ class DatabaseManager:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_suggestions_session ON teaching_suggestions(session_id);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_students_course ON students(course_code);")
 
+            # Partial unique index: enforces that a student cannot be assigned to multiple tracks in one session
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_session_student 
+                ON attendance_records(session_id, assigned_student_id) 
+                WHERE assigned_student_id IS NOT NULL;
+                """
+            )
+            cursor.execute("PRAGMA user_version = 2;")
+
+    def get_schema_version(self) -> int:
+        """Return the current SQLite schema user_version pragma."""
+        with self.get_connection() as conn:
+            row = conn.execute("PRAGMA user_version;").fetchone()
+            return int(row[0]) if row else 0
+
     # =========================================================================
     # Session CRUD Operations
     # =========================================================================
@@ -307,6 +353,7 @@ class DatabaseManager:
         limit: int = 50,
         offset: int = 0,
         course_code: Optional[str] = None,
+        status: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         List sessions ordered by creation date descending with optional pagination and filtering.
@@ -315,30 +362,23 @@ class DatabaseManager:
             limit: Maximum number of records to return.
             offset: Number of records to skip.
             course_code: Optional course filter.
+            status: Optional session status filter (e.g. 'ACTIVE', 'CONCLUDED').
 
         Returns:
             List of session record dictionaries.
         """
         with self.get_connection() as conn:
+            query = "SELECT * FROM sessions WHERE 1=1"
+            params: List[Any] = []
             if course_code:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM sessions 
-                    WHERE course_code = ? 
-                    ORDER BY created_at DESC 
-                    LIMIT ? OFFSET ?;
-                    """,
-                    (course_code, limit, offset),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM sessions 
-                    ORDER BY created_at DESC 
-                    LIMIT ? OFFSET ?;
-                    """,
-                    (limit, offset),
-                ).fetchall()
+                query += " AND course_code = ?"
+                params.append(course_code)
+            if status:
+                query += " AND status = ?"
+                params.append(status)
+            query += " ORDER BY created_at DESC, session_id DESC LIMIT ? OFFSET ?;"
+            params.extend([limit, offset])
+            rows = conn.execute(query, tuple(params)).fetchall()
             return [dict(r) for r in rows]
 
     def update_session_status(
@@ -442,8 +482,12 @@ class DatabaseManager:
         with self.get_connection() as conn:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO students (student_id, course_code, full_name, email)
-                VALUES (?, ?, ?, ?);
+                INSERT INTO students (student_id, course_code, full_name, email)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(student_id) DO UPDATE SET
+                    course_code = excluded.course_code,
+                    full_name = excluded.full_name,
+                    email = excluded.email;
                 """,
                 (student_id, course_code, full_name, email),
             )
@@ -470,8 +514,12 @@ class DatabaseManager:
         with self.get_connection() as conn:
             cursor = conn.executemany(
                 """
-                INSERT OR REPLACE INTO students (student_id, course_code, full_name, email)
-                VALUES (?, ?, ?, ?);
+                INSERT INTO students (student_id, course_code, full_name, email)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(student_id) DO UPDATE SET
+                    course_code = excluded.course_code,
+                    full_name = excluded.full_name,
+                    email = excluded.email;
                 """,
                 params,
             )
@@ -588,11 +636,12 @@ class DatabaseManager:
         total_detected_seconds: float,
         sustained_presence_status: str,
         assigned_student_id: Optional[str] = None,
-        verification_method: str = "ANONYMOUS",
+        verification_method: Optional[str] = None,
         correction_notes: Optional[str] = None,
     ) -> None:
         """
         Upsert a tracked subject's presence log using parameterized SQL.
+        Preserves teacher overrides and corrections when automated tracker updates arrive.
 
         Args:
             record_id: Unique record ID.
@@ -603,7 +652,7 @@ class DatabaseManager:
             total_detected_seconds: Total detected presence duration.
             sustained_presence_status: Status classification.
             assigned_student_id: Optional linked student ID.
-            verification_method: Verification method.
+            verification_method: Optional verification method ('ANONYMOUS', 'TEACHER_CONFIRMED', etc.).
             correction_notes: Optional teacher notes.
         """
         with self.get_connection() as conn:
@@ -613,13 +662,20 @@ class DatabaseManager:
                     record_id, session_id, track_id, first_seen_timestamp,
                     last_seen_timestamp, total_detected_seconds, sustained_presence_status,
                     assigned_student_id, verification_method, correction_notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'ANONYMOUS'), ?)
                 ON CONFLICT(session_id, track_id) DO UPDATE SET
                     last_seen_timestamp = excluded.last_seen_timestamp,
                     total_detected_seconds = excluded.total_detected_seconds,
-                    sustained_presence_status = excluded.sustained_presence_status,
+                    sustained_presence_status = CASE
+                        WHEN ? LIKE 'TEACHER_%' THEN excluded.sustained_presence_status
+                        WHEN attendance_records.verification_method LIKE 'TEACHER_%' THEN attendance_records.sustained_presence_status
+                        ELSE excluded.sustained_presence_status
+                    END,
                     assigned_student_id = COALESCE(excluded.assigned_student_id, attendance_records.assigned_student_id),
-                    verification_method = COALESCE(excluded.verification_method, attendance_records.verification_method),
+                    verification_method = CASE
+                        WHEN ? IS NOT NULL THEN ?
+                        ELSE attendance_records.verification_method
+                    END,
                     correction_notes = COALESCE(excluded.correction_notes, attendance_records.correction_notes);
                 """,
                 (
@@ -633,6 +689,9 @@ class DatabaseManager:
                     assigned_student_id,
                     verification_method,
                     correction_notes,
+                    verification_method,
+                    verification_method,
+                    verification_method,
                 ),
             )
 
@@ -703,19 +762,33 @@ class DatabaseManager:
         track_id: int,
         student_id: Optional[str],
         verification_method: str = "TEACHER_CONFIRMED",
-    ) -> None:
+    ) -> bool:
         """
         Manually link an anonymous tracking ID to an enrolled student record.
         Strictly requires teacher confirmation or explicit token.
+        If the student is already assigned to another track in this session,
+        unassigns them from the other track first to prevent double-counting.
 
         Args:
             session_id: Session identifier.
             track_id: Anonymous tracking identifier.
             student_id: Enrolled student identifier, or None to unassign.
             verification_method: Verification method label.
+
+        Returns:
+            True if the target track was found and updated, False otherwise.
         """
         with self.get_connection() as conn:
-            conn.execute(
+            if student_id is not None:
+                conn.execute(
+                    """
+                    UPDATE attendance_records
+                    SET assigned_student_id = NULL
+                    WHERE session_id = ? AND assigned_student_id = ? AND track_id != ?;
+                    """,
+                    (session_id, student_id, track_id),
+                )
+            cursor = conn.execute(
                 """
                 UPDATE attendance_records
                 SET assigned_student_id = ?,
@@ -725,6 +798,7 @@ class DatabaseManager:
                 """,
                 (student_id, verification_method, session_id, track_id),
             )
+            return cursor.rowcount > 0
 
     def update_attendance_status(
         self,
@@ -733,7 +807,7 @@ class DatabaseManager:
         status: str,
         verification_method: str = "TEACHER_OVERRIDE",
         notes: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         """
         Support authorized teacher correction/override of attendance status.
 
@@ -743,9 +817,12 @@ class DatabaseManager:
             status: New attendance status ('SUSTAINED_PRESENT', 'PROVISIONAL', etc.).
             verification_method: Verification method.
             notes: Optional explanatory notes.
+
+        Returns:
+            True if the record was found and updated, False otherwise.
         """
         with self.get_connection() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE attendance_records
                 SET sustained_presence_status = ?,
@@ -756,6 +833,7 @@ class DatabaseManager:
                 """,
                 (status, verification_method, notes, session_id, track_id),
             )
+            return cursor.rowcount > 0
 
     def override_attendance_record(
         self,
@@ -769,6 +847,7 @@ class DatabaseManager:
         """
         Comprehensive manual attendance correction method.
         Updates status, optional student assignment, and appends an audit event.
+        Preserves existing notes if reason is None.
 
         Args:
             session_id: Session identifier.
@@ -792,6 +871,15 @@ class DatabaseManager:
                 return False
 
             if student_id is not None:
+                # Unassign from any other track in the same session to avoid duplicate assignments
+                conn.execute(
+                    """
+                    UPDATE attendance_records
+                    SET assigned_student_id = NULL
+                    WHERE session_id = ? AND assigned_student_id = ? AND track_id != ?;
+                    """,
+                    (session_id, student_id, track_id),
+                )
                 conn.execute(
                     """
                     UPDATE attendance_records
@@ -799,7 +887,7 @@ class DatabaseManager:
                         assigned_student_id = ?,
                         verification_method = ?,
                         verified_at = CURRENT_TIMESTAMP,
-                        correction_notes = ?
+                        correction_notes = COALESCE(?, correction_notes)
                     WHERE session_id = ? AND track_id = ?;
                     """,
                     (status, student_id, verification_method, reason, session_id, track_id),
@@ -811,7 +899,7 @@ class DatabaseManager:
                     SET sustained_presence_status = ?,
                         verification_method = ?,
                         verified_at = CURRENT_TIMESTAMP,
-                        correction_notes = ?
+                        correction_notes = COALESCE(?, correction_notes)
                     WHERE session_id = ? AND track_id = ?;
                     """,
                     (status, verification_method, reason, session_id, track_id),
@@ -844,6 +932,8 @@ class DatabaseManager:
     ) -> None:
         """
         Insert a manual attendance entry for a student who was not automatically tracked.
+        If the student was previously attached to an auto track in this session,
+        unassigns them from the old track to prevent multiple track assignments.
 
         Args:
             record_id: Unique record ID.
@@ -857,6 +947,15 @@ class DatabaseManager:
         import time
         now = time.time()
         with self.get_connection() as conn:
+            if student_id is not None:
+                conn.execute(
+                    """
+                    UPDATE attendance_records
+                    SET assigned_student_id = NULL
+                    WHERE session_id = ? AND assigned_student_id = ?;
+                    """,
+                    (session_id, student_id),
+                )
             conn.execute(
                 """
                 INSERT INTO attendance_records (
@@ -890,7 +989,7 @@ class DatabaseManager:
         timestamp: float,
         event_type: str,
         description: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         """
         Log a timestamped attendance event using parameterized SQL.
 
@@ -901,15 +1000,19 @@ class DatabaseManager:
             timestamp: Event epoch timestamp.
             event_type: Event classification ('ENTRY', 'EXIT', 'SUSTAINED_PRESENCE_MET', etc.).
             description: Human-readable context.
+
+        Returns:
+            True if event was inserted, False if ignored due to duplicate event_id.
         """
         with self.get_connection() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO attendance_events (event_id, session_id, track_id, timestamp, event_type, description)
                 VALUES (?, ?, ?, ?, ?, ?);
                 """,
                 (event_id, session_id, track_id, timestamp, event_type, description),
             )
+            return cursor.rowcount > 0
 
     def log_attendance_event(
         self,
@@ -1177,11 +1280,12 @@ class DatabaseManager:
 
     def purge_old_records(self, days_threshold: Optional[int] = None) -> int:
         """
-        Purge sessions and all cascading telemetry created older than N days.
+        Purge concluded sessions and all cascading telemetry created older than N days.
         Default days_threshold is loaded from settings.privacy.auto_purge_days.
+        Enforces a minimum retention threshold of 1 day and strictly preserves active/in-progress sessions.
 
         Args:
-            days_threshold: Number of days to retain records.
+            days_threshold: Number of days to retain records (minimum 1 day).
 
         Returns:
             Number of purged sessions.
@@ -1189,13 +1293,14 @@ class DatabaseManager:
         if days_threshold is None:
             days_threshold = settings.privacy.auto_purge_days
 
-        days_threshold = max(0, int(days_threshold))
+        days_threshold = max(1, int(days_threshold))
 
         with self.get_connection() as conn:
             cursor = conn.execute(
                 """
                 DELETE FROM sessions
-                WHERE created_at < datetime('now', '-' || ? || ' days');
+                WHERE created_at < datetime('now', '-' || ? || ' days')
+                  AND status = 'CONCLUDED';
                 """,
                 (str(days_threshold),),
             )

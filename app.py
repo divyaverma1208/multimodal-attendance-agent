@@ -12,17 +12,22 @@ from config.settings import settings
 from modules.database import DatabaseManager
 from ui.dashboard import render_dashboard
 
-# Configure application logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    force=True,
 )
 logger = logging.getLogger("attendance_agent")
 
 
+@st.cache_resource
+def get_db() -> DatabaseManager:
+    """Create the database manager once per server process."""
+    logger.info("Initializing database at %s", settings.db.db_path)
+    return DatabaseManager(db_path=settings.db.db_path)
+
+
 def main() -> None:
-    """Main application lifecycle runner."""
-    # Set up Streamlit page configuration
     st.set_page_config(
         page_title="Classroom Intelligence Agent",
         page_icon="🎓",
@@ -30,10 +35,13 @@ def main() -> None:
         initial_sidebar_state="expanded",
     )
 
-    # Initialize local SQLite storage
-    db = DatabaseManager(db_path=settings.db.db_path)
+    try:
+        db = get_db()
+    except Exception as exc:
+        logger.exception("Database initialization failed")
+        st.error(f"Could not open the database: {exc}")
+        st.stop()
 
-    # Render presentation dashboard
     render_dashboard(db)
 
 

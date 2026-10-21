@@ -13,6 +13,7 @@ from modules.attendance import AttendanceEngine, AttendanceStatus
 from modules.database import DatabaseManager
 from modules.report_generator import ReportGenerator
 from ui.demo_data import is_demo_session
+from ui.navigation import navigate_to
 
 
 def render_attendance_page(db: DatabaseManager) -> None:
@@ -30,8 +31,7 @@ def render_attendance_page(db: DatabaseManager) -> None:
         col_c1, col_c2 = st.columns([1, 4])
         with col_c1:
             if st.button("➕ Go to Sessions", type="primary"):
-                st.session_state.main_nav_selection = "Classroom Sessions"
-                st.rerun()
+                navigate_to("Classroom Sessions")
         return
 
     # Select Session

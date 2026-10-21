@@ -195,11 +195,13 @@ def render_recommendations_page(db: DatabaseManager) -> None:
     st.markdown("---")
 
     # Section 3: Ethical Boundaries & Limitations of Automated Observations (Requirement 9)
-    st.subheader("⚠️ Ethical Boundaries & Observation Limitations")
-    st.info(
-        "🛡️ **Institutional Safeguards & Epistemic Boundaries:**\n"
-        "- **Advisory Decision Support:** All recommendations are advisory and optional decision-support tools for the human educator.\n"
-        "- **Non-Punitive & Non-Disciplinary:** The system never executes disciplinary actions, penalizes students, or evaluates teacher performance.\n"
-        "- **No Psychological or Cognitive Inferences:** Suggestions trigger solely on deterministic multi-window acoustic ratios and physical motion dynamics. The engine does NOT infer student emotion, attentiveness, learning ability, or comprehension.\n"
-        "- **Sensor Outage Resilience:** Missing audio or camera feeds trigger diagnostics (e.g. `RULE_CHECK_AUDIO_QUALITY`) rather than generating false instructional suggestions."
-    )
+    st.subheader("🛡️ Ethical Boundaries & Institutional Safeguards")
+    with st.expander("📖 View Institutional Safeguards & Epistemic Boundaries", expanded=False):
+        st.markdown(
+            """
+            - **Advisory Decision Support:** All recommendations are advisory and optional decision-support tools for the human educator.
+            - **Non-Punitive & Non-Disciplinary:** The system never executes disciplinary actions, penalizes students, or evaluates teacher performance.
+            - **No Psychological or Cognitive Inferences:** Suggestions trigger solely on deterministic multi-window acoustic ratios and physical motion dynamics. The engine does NOT infer student emotion, attentiveness, learning ability, or comprehension.
+            - **Sensor Outage Resilience:** Missing audio or camera feeds trigger diagnostics (e.g. `RULE_CHECK_AUDIO_QUALITY`) rather than generating false instructional suggestions.
+            """
+        )

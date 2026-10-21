@@ -220,6 +220,36 @@ class FeatureFusionEngine:
         if audio_features is not None:
             self._audio_buffer.append((now, audio_features))
 
+    def get_current_instantaneous_activity(self) -> Optional[float]:
+        """
+        Compute real-time estimated activity score from samples currently accumulated
+        in the open window, avoiding empty or pending display states during accumulation.
+        """
+        if not self._visual_buffer and not self._audio_buffer:
+            return None
+
+        # Mean visual movement
+        avg_motion: Optional[float] = None
+        avg_head_var: Optional[float] = None
+        if self._visual_buffer:
+            avg_motion = float(np.mean([v.visual_movement_index for v in self._visual_buffer]))
+            avg_head_var = float(np.mean([v.head_pose_variance for v in self._visual_buffer]))
+
+        # Mean acoustic features
+        avg_speech: Optional[float] = None
+        avg_rms: Optional[float] = None
+        if self._audio_buffer:
+            speech_bools = [100.0 if a.is_speech else 0.0 for _, a in self._audio_buffer]
+            avg_speech = float(np.mean(speech_bools))
+            avg_rms = float(np.mean([a.rms_energy for _, a in self._audio_buffer]))
+
+        return self.compute_composite_activity_score(
+            visual_movement=avg_motion,
+            head_pose_variance=avg_head_var,
+            speech_activity_pct=avg_speech,
+            rms_energy=avg_rms,
+        )
+
     def is_window_ready(self, current_timestamp: float) -> bool:
         """Check if elapsed time exceeds the configured window duration."""
         if self.current_window_start is None:

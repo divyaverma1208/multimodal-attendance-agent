@@ -57,6 +57,7 @@ class SessionManager:
         self.db = db_manager or db or DatabaseManager()
         self.current_session: Optional[SessionMetadata] = None
         self._last_resume_timestamp: Optional[float] = None
+        self.recover_unclosed_sessions()
 
     def create_session(
         self,
@@ -79,6 +80,9 @@ class SessionManager:
         Returns:
             Configured SessionMetadata instance.
         """
+        if self.current_session and self.current_session.status in (SessionState.ACTIVE, SessionState.PAUSED):
+            self.conclude_session()
+
         session_id = f"sess_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         self.db.create_session(
             session_id=session_id,
@@ -102,12 +106,41 @@ class SessionManager:
         self._last_resume_timestamp = None
         return metadata
 
+    def recover_unclosed_sessions(self) -> int:
+        """
+        Detect and safely conclude any dangling ACTIVE or PAUSED sessions in SQLite
+        left over from unexpected crashes or abrupt process terminations.
+
+        Returns:
+            Count of recovered sessions.
+        """
+        recovered_count = 0
+        now_iso = datetime.now().isoformat()
+        try:
+            for status_val in ("ACTIVE", "PAUSED"):
+                stale_sessions = self.db.list_sessions(status=status_val)
+                for s in stale_sessions:
+                    if self.current_session and s["session_id"] == self.current_session.session_id:
+                        continue
+                    self.db.update_session_status(
+                        session_id=s["session_id"],
+                        status=SessionState.CONCLUDED.value,
+                        concluded_at=now_iso,
+                    )
+                    recovered_count += 1
+        except Exception:
+            pass
+        return recovered_count
+
     def start_session(self) -> None:
         """Transition session from READY or PAUSED to ACTIVE."""
         if not self.current_session:
             raise RuntimeError("No session currently initialized.")
         if self.current_session.status not in (SessionState.READY, SessionState.PAUSED):
             raise ValueError(f"Cannot start session from state '{self.current_session.status}'.")
+
+        # Guarantee no other session in DB remains active
+        self.recover_unclosed_sessions()
 
         now = time.time()
         now_iso = datetime.now().isoformat()

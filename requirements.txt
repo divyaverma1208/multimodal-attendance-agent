@@ -2,8 +2,8 @@
 streamlit>=1.35.0
 
 # Computer Vision & Multimodal Perception
-opencv-python>=4.9.0
-mediapipe>=1.1.0
+opencv-contrib-python>=4.9.0
+mediapipe>=0.10.0
 
 # Numerical, Scientific & Data Analysis
 numpy>=2.0.0
@@ -11,7 +11,7 @@ pandas>=2.2.0
 scipy>=1.13.0
 
 # Acoustic & Audio Feature Extraction
-librosa>=0.10.0
+librosa>=0.10.2
 
 # Interactive Visualizations
 plotly>=5.20.0

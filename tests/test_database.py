@@ -19,6 +19,7 @@ Validates all 15 core database requirements:
 """
 
 from pathlib import Path
+import sqlite3
 import tempfile
 import time
 import pytest
@@ -542,10 +543,10 @@ def test_record_retention_and_purge(temp_db: DatabaseManager) -> None:
     temp_db.create_session(sess_old, "HIST101", "Old History", "file")
     temp_db.create_session(sess_new, "HIST101", "New History", "file")
 
-    # Artificially age the old session by setting created_at to 40 days ago
+    # Artificially age the old session by setting created_at to 40 days ago and mark CONCLUDED
     with temp_db.get_connection() as conn:
         conn.execute(
-            "UPDATE sessions SET created_at = datetime('now', '-40 days') WHERE session_id = ?;",
+            "UPDATE sessions SET created_at = datetime('now', '-40 days'), status = 'CONCLUDED' WHERE session_id = ?;",
             (sess_old,),
         )
 
@@ -625,3 +626,206 @@ def test_student_deletion_preserves_attendance_track(temp_db: DatabaseManager) -
     assert rec_after is not None
     assert rec_after["assigned_student_id"] is None
     assert rec_after["sustained_presence_status"] == "SUSTAINED_PRESENT"
+
+
+# -----------------------------------------------------------------------------
+# 16. Regression Tests for Reported Bugs
+# -----------------------------------------------------------------------------
+
+def test_upsert_preserves_teacher_corrections(temp_db: DatabaseManager) -> None:
+    """Verify that automated pipeline tracker updates do not overwrite teacher overrides."""
+    sess_id = "sess_teacher_protect"
+    temp_db.create_session(sess_id, "CS101", "Teacher Protection Test", "webcam")
+    temp_db.insert_student("STU_T1", "CS101", "Ada Lovelace")
+
+    # Initial tracker detection
+    temp_db.upsert_attendance_record(
+        record_id="rec_tp_1",
+        session_id=sess_id,
+        track_id=1,
+        first_seen_timestamp=0.0,
+        last_seen_timestamp=100.0,
+        total_detected_seconds=100.0,
+        sustained_presence_status="TRANSIENT",
+    )
+
+    # Teacher overrides status and adds notes
+    ok = temp_db.override_attendance_record(
+        session_id=sess_id,
+        track_id=1,
+        status="SUSTAINED_PRESENT",
+        student_id="STU_T1",
+        reason="Teacher confirmed presence in front row",
+    )
+    assert ok is True
+
+    # Subsequent tracker update from video processing pipeline
+    temp_db.upsert_attendance_record(
+        record_id="rec_tp_1",
+        session_id=sess_id,
+        track_id=1,
+        first_seen_timestamp=0.0,
+        last_seen_timestamp=200.0,
+        total_detected_seconds=110.0,
+        sustained_presence_status="TRANSIENT",
+        verification_method=None,
+    )
+
+    # Overridden status and verification method must be preserved
+    rec = temp_db.get_attendance_record(sess_id, 1)
+    assert rec is not None
+    assert rec["sustained_presence_status"] == "SUSTAINED_PRESENT"
+    assert rec["verification_method"] == "TEACHER_OVERRIDE"
+    assert rec["assigned_student_id"] == "STU_T1"
+    assert "front row" in rec["correction_notes"]
+    assert rec["last_seen_timestamp"] == 200.0
+
+
+def test_student_insert_and_bulk_update_does_not_unlink_attendance(temp_db: DatabaseManager) -> None:
+    """Verify that updating student information does NOT trigger ON DELETE SET NULL on attendance."""
+    sess_id = "sess_roster_update"
+    temp_db.create_session(sess_id, "CS101", "Roster Re-import Test", "webcam")
+    temp_db.insert_student("STU_LINK", "CS101", "Original Name", "orig@univ.edu")
+
+    temp_db.upsert_attendance_record("rec_lnk_1", sess_id, 1, 0, 100, 100, "SUSTAINED_PRESENT")
+    ok = temp_db.assign_student_to_track(sess_id, 1, "STU_LINK")
+    assert ok is True
+
+    rec = temp_db.get_attendance_record(sess_id, 1)
+    assert rec["assigned_student_id"] == "STU_LINK"
+
+    # Re-inserting / fixing typo on student must not unlink attendance
+    temp_db.insert_student("STU_LINK", "CS101", "Corrected Name", "new@univ.edu")
+    rec_after = temp_db.get_attendance_record(sess_id, 1)
+    assert rec_after["assigned_student_id"] == "STU_LINK"
+    assert rec_after["student_name"] == "Corrected Name"
+
+    # Bulk insert must also preserve links
+    count = temp_db.bulk_insert_students([
+        {"student_id": "STU_LINK", "course_code": "CS101", "full_name": "Bulk Name", "email": "b@univ.edu"}
+    ])
+    assert count == 1
+    rec_after_bulk = temp_db.get_attendance_record(sess_id, 1)
+    assert rec_after_bulk["assigned_student_id"] == "STU_LINK"
+    assert rec_after_bulk["student_name"] == "Bulk Name"
+
+
+def test_override_preserves_notes_when_reason_is_none(temp_db: DatabaseManager) -> None:
+    """Verify that override_attendance_record with reason=None does not wipe existing notes."""
+    sess_id = "sess_notes_preserve"
+    temp_db.create_session(sess_id, "CS101", "Notes Preserve", "webcam")
+    temp_db.upsert_attendance_record("rec_np_1", sess_id, 1, 0, 100, 100, "TRANSIENT")
+
+    temp_db.update_attendance_status(
+        session_id=sess_id,
+        track_id=1,
+        status="PROVISIONAL",
+        notes="Pre-existing notes from earlier review",
+    )
+
+    # Calling override with reason=None should preserve notes
+    temp_db.override_attendance_record(
+        session_id=sess_id,
+        track_id=1,
+        status="SUSTAINED_PRESENT",
+        reason=None,
+    )
+
+    rec = temp_db.get_attendance_record(sess_id, 1)
+    assert rec is not None
+    assert rec["sustained_presence_status"] == "SUSTAINED_PRESENT"
+    assert rec["correction_notes"] == "Pre-existing notes from earlier review"
+
+
+def test_single_student_reassignment_prevents_duplicate_tracks(temp_db: DatabaseManager) -> None:
+    """Verify that reassigning a student to a new track unassigns them from any previous track in that session."""
+    sess_id = "sess_single_stu"
+    temp_db.create_session(sess_id, "CS101", "Single Track Test", "webcam")
+    temp_db.insert_student("STU_DUP", "CS101", "Duplicate Test Student")
+
+    temp_db.upsert_attendance_record("rec_d1", sess_id, 1, 0, 50, 50, "TRANSIENT")
+    temp_db.upsert_attendance_record("rec_d2", sess_id, 2, 55, 100, 45, "TRANSIENT")
+
+    # Assign student to track 1
+    temp_db.assign_student_to_track(sess_id, 1, "STU_DUP")
+    assert temp_db.get_attendance_record(sess_id, 1)["assigned_student_id"] == "STU_DUP"
+
+    # Re-assign student to track 2
+    temp_db.assign_student_to_track(sess_id, 2, "STU_DUP")
+    assert temp_db.get_attendance_record(sess_id, 2)["assigned_student_id"] == "STU_DUP"
+    # Track 1 must be unassigned
+    assert temp_db.get_attendance_record(sess_id, 1)["assigned_student_id"] is None
+
+
+def test_purge_old_records_requirements(temp_db: DatabaseManager) -> None:
+    """Verify purge_old_records enforces min 1 day and only purges CONCLUDED sessions."""
+    sess_active = "sess_purge_active"
+    sess_concluded = "sess_purge_concluded"
+    temp_db.create_session(sess_active, "CS101", "Active Session", "webcam")
+    temp_db.create_session(sess_concluded, "CS101", "Concluded Session", "webcam")
+
+    with temp_db.get_connection() as conn:
+        conn.execute("UPDATE sessions SET created_at = datetime('now', '-50 days'), status = 'ACTIVE' WHERE session_id = ?;", (sess_active,))
+        conn.execute("UPDATE sessions SET created_at = datetime('now', '-50 days'), status = 'CONCLUDED' WHERE session_id = ?;", (sess_concluded,))
+
+    # purge with 0 should be clamped to at least 1 day and only delete CONCLUDED
+    purged = temp_db.purge_old_records(days_threshold=0)
+    assert purged == 1
+    assert temp_db.get_session(sess_concluded) is None
+    assert temp_db.get_session(sess_active) is not None  # Active session is preserved
+
+
+def test_database_integrity_error_subclass_hierarchy(temp_db: DatabaseManager) -> None:
+    """Verify that DatabaseIntegrityError can be caught by both DatabaseError and sqlite3.IntegrityError."""
+    from modules.database import DatabaseError, DatabaseIntegrityError
+
+    assert issubclass(DatabaseIntegrityError, DatabaseError)
+    assert issubclass(DatabaseIntegrityError, sqlite3.IntegrityError)
+    assert issubclass(DatabaseError, sqlite3.Error)
+
+    sess_id = "sess_err_test"
+    temp_db.create_session(sess_id, "CS101", "Error Hierarchy", "webcam")
+    temp_db.insert_student("STU_EH", "CS101", "Error Test")
+    temp_db.upsert_attendance_record("rec_eh1", sess_id, 1, 0, 10, 10, "TRANSIENT", assigned_student_id="STU_EH")
+
+    # Direct raw violation of partial unique index
+    with pytest.raises(sqlite3.IntegrityError):
+        with temp_db.get_connection() as conn:
+            conn.execute(
+                "INSERT INTO attendance_records (record_id, session_id, track_id, first_seen_timestamp, last_seen_timestamp, total_detected_seconds, sustained_presence_status, assigned_student_id) VALUES ('rec_eh2', ?, 2, 0, 10, 10, 'TRANSIENT', 'STU_EH');",
+                (sess_id,),
+            )
+
+
+def test_schema_version_pragma(temp_db: DatabaseManager) -> None:
+    """Verify schema versioning pragma is active and returns expected version."""
+    version = temp_db.get_schema_version()
+    assert version >= 2
+
+
+def test_in_memory_thread_safety() -> None:
+    """Verify in-memory database operations are serialized safely across threads."""
+    import threading
+
+    mem_db = DatabaseManager(db_path=":memory:")
+    errors: List[Exception] = []
+
+    def worker(worker_id: int) -> None:
+        try:
+            for i in range(10):
+                sess_id = f"worker_{worker_id}_sess_{i}"
+                mem_db.create_session(sess_id, "TEST", f"Title {i}", "webcam")
+                mem_db.get_session(sess_id)
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(w,)) for w in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(errors) == 0
+    sessions = mem_db.list_sessions(limit=100)
+    assert len(sessions) == 40
+    mem_db.close()
