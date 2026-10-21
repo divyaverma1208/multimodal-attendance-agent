@@ -3,9 +3,10 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![UI-Streamlit](https://img.shields.io/badge/UI-Streamlit-red.svg)](https://streamlit.io/)
 [![Database-SQLite3](https://img.shields.io/badge/Database-SQLite3%20WAL-lightgrey.svg)](https://www.sqlite.org/)
-[![Tests-138%20Passing](https://img.shields.io/badge/tests-138%20passing-brightgreen.svg)](tests/)
+[![Tests-160%20Passing](https://img.shields.io/badge/tests-160%20passing-brightgreen.svg)](tests/)
 [![Architecture-Offline--First](https://img.shields.io/badge/Architecture-100%25%20Offline--First-darkgreen.svg)](#-privacy-by-design--ethical-safeguards)
 [![License-Apache_2.0](https://img.shields.io/badge/License-Apache_2.0-green.svg)](LICENSE)
+[![GitHub-Repo](https://img.shields.io/badge/GitHub-divyaverma1208%2Fmultimodal--attendance--agent-blue?logo=github)](https://github.com/divyaverma1208/multimodal-attendance-agent)
 
 An **offline-first classroom intelligence application** that records verified session attendance, analyzes observable classroom activity using video and optional audio streams, generates deterministic pedagogical teaching suggestions, and provides interactive analytics through an educator dashboard.
 
@@ -361,7 +362,7 @@ The teaching suggestion engine uses deterministic, transparent heuristic rules t
 ### Clean Installation from Source
 ```bash
 # 1. Clone the repository
-git clone https://github.com/your-username/multimodal-attendance-agent.git
+git clone https://github.com/divyaverma1208/multimodal-attendance-agent.git
 cd multimodal-attendance-agent
 
 # 2. Create a clean virtual environment
@@ -377,13 +378,48 @@ pip install -r requirements.txt
 # 5. Verify installation by running unit tests
 pytest -q
 ```
-*Expected Test Output:* `138 passed in ~5s`.
+*Expected Test Output:* `160 passed in ~6s`.
 
-### Launching the Dashboard
+### Launching the Dashboard Locally
 ```bash
 streamlit run app.py
 ```
 Open **`http://localhost:8501`** in any web browser.
+
+---
+
+## 🚀 Deployment Options
+
+### 1. Streamlit Community Cloud (Free 1-Click Cloud Deployment)
+1. Fork or push this repository to your GitHub account: `https://github.com/divyaverma1208/multimodal-attendance-agent`
+2. Go to [share.streamlit.io](https://share.streamlit.io/) and click **New App**.
+3. Select:
+   - **Repository:** `divyaverma1208/multimodal-attendance-agent`
+   - **Branch:** `main`
+   - **Main file path:** `app.py`
+4. Click **Deploy!**
+*(Note: `packages.txt` is pre-configured with Linux system dependencies `libgl1`, `portaudio19-dev`, and `libsndfile1` so cloud builds succeed automatically).*
+
+### 2. Docker & Docker Compose Container Deployment
+Run the containerized application with isolated volumes:
+```bash
+# Build and run in detached mode
+docker compose up -d --build
+
+# View container status
+docker ps
+
+# Follow application logs
+docker compose logs -f
+```
+The application will be live at `http://localhost:8501`. SQLite database records are persisted in the named Docker volume `attendance_data`.
+
+### 3. Production Linux Server (Ubuntu/Debian VPS with Nginx & SSL)
+A complete systemd unit file and Nginx reverse proxy configuration are provided in `config/`:
+- **Systemd Service:** `config/classroom_agent.service` (auto-restarts on reboot or crash)
+- **Nginx Reverse Proxy:** `config/nginx_classroom_agent.conf` (WebSockets and SSL termination)
+- **Full Setup Guide:** See [docs/custom_domain_deployment.md](file:///Users/divyaverma/multimodal-attendance-agent/docs/custom_domain_deployment.md) for step-by-step instructions with Let's Encrypt SSL.
+
 
 ---
 

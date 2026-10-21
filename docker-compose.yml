@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  classroom-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: multimodal-attendance-agent:latest
+    container_name: classroom_attendance_agent
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      - TARGET_FPS=8
+      - DETECTION_CONFIDENCE=0.65
+      - SUSTAINED_THRESHOLD_PCT=60.0
+      - AUTO_PURGE_DAYS=30
+    volumes:
+      - attendance_data:/app/data
+
+volumes:
+  attendance_data:
+    driver: local
